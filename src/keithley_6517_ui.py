@@ -76,6 +76,7 @@ FOOTER_NAV_ITEMS = (
 
 ICON_ROOT = Path(__file__).resolve().parents[1] / "assets" / "icons" / "codicons" / "png"
 BRANDING_ROOT = Path(__file__).resolve().parents[1] / "assets" / "branding"
+APP_ICON_PATH = BRANDING_ROOT / "keithley_6517_electrometer_icon_exact.png"
 RAD_WEBSITE = "https://radinstruments.com.br/"
 
 
@@ -175,6 +176,7 @@ class Keithley6517UI(ctk.CTk):
         ctk.set_appearance_mode(initial_state.theme)
         ctk.set_default_color_theme("blue")
         super().__init__(fg_color=COLORS["window"])
+        self._set_app_icon()
         self.coordinator = coordinator
         self.current_state = initial_state
         self.title("Keithley 6517 Control Studio")
@@ -220,6 +222,18 @@ class Keithley6517UI(ctk.CTk):
         self._apply_theme(initial_state.theme)
         self._render(initial_state)
         self._poll_after_id = self.after(self.POLL_MS, self._poll_application)
+
+    def _set_app_icon(self) -> None:
+        """Use the RAD/Keithley artwork as the native application icon."""
+
+        if not APP_ICON_PATH.is_file():
+            return
+        try:
+            self._app_icon = tk.PhotoImage(file=str(APP_ICON_PATH))
+            self.iconphoto(True, self._app_icon)
+        except tk.TclError:
+            # Keep the UI usable if a packaged build is missing the optional asset.
+            self._app_icon = None
 
     def run(self) -> None:
         self.deiconify()
