@@ -226,6 +226,7 @@ class Keithley6517UI(ctk.CTk):
     def _set_app_icon(self) -> None:
         """Use the RAD/Keithley artwork as the native application icon."""
 
+        self._app_icon = None
         if not APP_ICON_PATH.is_file():
             return
         try:
@@ -380,6 +381,8 @@ class Keithley6517UI(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self, fg_color=COLORS["workspace"])
         self._about_window = dialog
+        if self._app_icon is not None:
+            dialog.iconphoto(False, self._app_icon)
         dialog.title("Sobre — Keithley 6517 Control Studio")
         dialog.resizable(False, False)
         dialog.transient(self)
