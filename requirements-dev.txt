@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Somente para reconstruir os PNGs de alta densidade a partir dos SVGs Codicons.
+svglib==2.1.0
+reportlab==5.0.0
+rlPyCairo==0.4.0

@@ -1,0 +1,52 @@
+# Ambientes Python e caches
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Configurações locais de IDE
+.vscode/*
+!.vscode/settings.example.json
+
+# Drivers, instaladores e arquivos binários locais
+drivers/
+*.zip
+*.7z
+*.msi
+*.exe
+*.dll
+*.sys
+
+# Dados gerados por aquisições
+data/*
+!data/amostras/
+!data/amostras/*.csv
+
+# Logs, temporários e saídas da aplicação
+var/
+log/
+logs/
+output/
+outputs/
+tmp/
+temp/
+*.log
+out.txt
+/test1
+/test2
+
+# Documentos locais ou potencialmente grandes
+Documentos/
+docs/referencias/
+docs/comunicação_modeloB/*.pdf
+
+# Arquivos do sistema operacional
+Thumbs.db
+Desktop.ini
