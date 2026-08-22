@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/branding/keithley_6517_electrometer_icon_exact.png" alt="Ícone do Keithley 6517 Electrometer Control" width="180">
+  <img src="assets/branding/keithley_6517_spectrum_icon.png" alt="Ícone do Keithley 6517 Electrometer Control" width="180">
 </p>
 
 <h1 align="center">Keithley 6517 Electrometer Control</h1>

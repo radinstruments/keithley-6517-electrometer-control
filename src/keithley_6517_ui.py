@@ -76,7 +76,9 @@ FOOTER_NAV_ITEMS = (
 
 ICON_ROOT = Path(__file__).resolve().parents[1] / "assets" / "icons" / "codicons" / "png"
 BRANDING_ROOT = Path(__file__).resolve().parents[1] / "assets" / "branding"
-APP_ICON_PATH = BRANDING_ROOT / "keithley_6517_electrometer_icon_exact.png"
+APP_ICON_PATH = BRANDING_ROOT / "keithley_6517_spectrum_icon.png"
+APP_ICON_ICO_PATH = BRANDING_ROOT / "keithley_6517_spectrum_icon.ico"
+WINDOWS_APP_ID = "RADInstruments.Keithley6517.ControlStudio"
 RAD_WEBSITE = "https://radinstruments.com.br/"
 
 
@@ -175,6 +177,7 @@ class Keithley6517UI(ctk.CTk):
         initial_state: ViewState = coordinator.state
         ctk.set_appearance_mode(initial_state.theme)
         ctk.set_default_color_theme("blue")
+        self._set_windows_app_id()
         super().__init__(fg_color=COLORS["window"])
         self._set_app_icon()
         self.coordinator = coordinator
@@ -223,6 +226,17 @@ class Keithley6517UI(ctk.CTk):
         self._render(initial_state)
         self._poll_after_id = self.after(self.POLL_MS, self._poll_application)
 
+    @staticmethod
+    def _set_windows_app_id() -> None:
+        """Prevent Windows from grouping the UI under Python's default icon."""
+
+        if os.name != "nt":
+            return
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+        except (AttributeError, OSError):
+            pass
+
     def _set_app_icon(self) -> None:
         """Use the RAD/Keithley artwork as the native application icon."""
 
@@ -235,6 +249,11 @@ class Keithley6517UI(ctk.CTk):
         except tk.TclError:
             # Keep the UI usable if a packaged build is missing the optional asset.
             self._app_icon = None
+        if os.name == "nt" and APP_ICON_ICO_PATH.is_file():
+            try:
+                self.iconbitmap(default=str(APP_ICON_ICO_PATH))
+            except tk.TclError:
+                pass
 
     def run(self) -> None:
         self.deiconify()
@@ -383,6 +402,11 @@ class Keithley6517UI(ctk.CTk):
         self._about_window = dialog
         if self._app_icon is not None:
             dialog.iconphoto(False, self._app_icon)
+        if os.name == "nt" and APP_ICON_ICO_PATH.is_file():
+            try:
+                dialog.iconbitmap(str(APP_ICON_ICO_PATH))
+            except tk.TclError:
+                pass
         dialog.title("Sobre — Keithley 6517 Control Studio")
         dialog.resizable(False, False)
         dialog.transient(self)
