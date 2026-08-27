@@ -205,8 +205,10 @@ de corrente. O limite nominal depende da faixa: aproximadamente 10 mA na faixa
 de 100 V e 1 mA na faixa de 1000 V.
 
 O botão **DESLIGAR AGORA** permanece disponível durante a aquisição. Ele coloca
-a saída em standby e zera o nível programado. Encerrar, cancelar ou falhar uma
-aquisição também executa a parada segura e desliga a fonte.
+a saída em standby e zera o nível programado. A aquisição apenas arma a leitura,
+restaura o trigger e preserva o estado da fonte; cancelar ou concluir uma coleta
+não desliga a alta tensão automaticamente. Use **DESLIGAR AGORA** para colocar
+a fonte em standby; encerrar o programa continua executando a parada segura.
 
 Fora da aquisição, enquanto a saída está ativa, o painel atualiza o estado a
 cada dois segundos. Se a leitura indicar interlock aberto com a saída ainda em

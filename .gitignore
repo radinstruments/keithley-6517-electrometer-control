@@ -17,6 +17,7 @@ htmlcov/
 
 # Drivers, instaladores e arquivos binários locais
 drivers/
+build/
 *.zip
 *.7z
 *.msi
@@ -31,6 +32,7 @@ data/*
 
 # Logs, temporários e saídas da aplicação
 var/
+config/
 log/
 logs/
 output/

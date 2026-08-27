@@ -24,12 +24,19 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+try:
+    from .keithley_6517_contracts import InstrumentSnapshot
+except ImportError:  # pragma: no cover - direct src execution compatibility
+    from keithley_6517_contracts import InstrumentSnapshot
 
 try:
     import pyvisa
+    from pyvisa import constants as visa_constants
 except ImportError:  # pragma: no cover - hardware dependency is optional in tests
     pyvisa = None
+    visa_constants = None
 
 
 PROTOCOL_LOGGER = logging.getLogger("keithley.protocol")
@@ -1152,17 +1159,57 @@ class VisaWorker:
     def close_resource(self) -> None:
         self._submit(lambda worker: worker._close_resource_local())
 
+    def go_to_local(self) -> bool:
+        """Return an open GPIB instrument to front-panel control."""
+
+        return bool(self._submit(lambda worker: worker._go_to_local_local()))
+
+    def _go_to_local_local(self) -> bool:
+        instrument = self._instrument
+        resource_name = self._resource_name or ""
+        if instrument is None or not resource_name.upper().startswith("GPIB"):
+            return False
+        control_ren = getattr(instrument, "control_ren", None)
+        if control_ren is None:
+            logging.warning(
+                "O backend VISA não oferece control_ren; painel pode permanecer remoto."
+            )
+            return False
+        mode = (
+            visa_constants.RENLineOperation.address_gtl
+            if visa_constants is not None
+            else 6
+        )
+        try:
+            control_ren(mode)
+        except Exception as error:
+            logging.warning("GPIB Go To Local falhou e foi ignorado: %s", error)
+            PROTOCOL_LOGGER.warning(
+                "GPIB GTL ERROR resource=%s error=%s", resource_name, error
+            )
+            return False
+        PROTOCOL_LOGGER.info("GPIB GTL resource=%s", resource_name)
+        logging.info("Controle do painel liberado por GPIB GTL: %s", resource_name)
+        return True
+
     def _close_resource_local(self) -> None:
         instrument = self._instrument
         resource_name = self._resource_name or "unknown"
-        self._instrument = None
-        self._resource_name = None
-        with self._state_lock:
-            self._is_open = False
         if instrument is not None:
-            instrument.close()
-            PROTOCOL_LOGGER.info("CLOSE resource=%s", resource_name)
-            logging.info("Sessão VISA fechada pelo worker.")
+            try:
+                self._go_to_local_local()
+            finally:
+                self._instrument = None
+                self._resource_name = None
+                with self._state_lock:
+                    self._is_open = False
+                instrument.close()
+                PROTOCOL_LOGGER.info("CLOSE resource=%s", resource_name)
+                logging.info("Sessão VISA fechada pelo worker.")
+        else:
+            self._resource_name = None
+            with self._state_lock:
+                self._is_open = False
 
     def shutdown(self) -> None:
         with self._state_lock:
@@ -1240,6 +1287,21 @@ def _raise_instrument_errors(instrument: Any, profile: InstrumentProfile) -> Non
     errors = _drain_errors(instrument, profile)
     if errors:
         raise InstrumentCommandError(errors)
+
+
+def _log_preexisting_errors(
+    instrument: Any, profile: InstrumentProfile, context: str
+) -> List[str]:
+    """Separate stale queue entries from errors caused by a new operation."""
+
+    errors = _drain_errors(instrument, profile)
+    if errors:
+        message = " | ".join(errors)
+        logging.warning("Erros SCPI preexistentes antes de %s: %s", context, message)
+        PROTOCOL_LOGGER.warning(
+            "PREEXISTING ERRORS before=%s | %s", context, message
+        )
+    return errors
 
 
 def _parse_scpi_bool(value: Any) -> bool:
@@ -1372,9 +1434,13 @@ class KeithleyController:
         self._configured_nplc = 1.0
         self._buffer_points = 0
         self._last_buffer_compliance_final = False
+        self._acquisition_restore_commands: Tuple[str, ...] = ()
+        self._acquisition_restore_continuous: Optional[bool] = None
         self._hv_enabled = False
+        self._hv_enabled_by_application = False
         self._voltage_source_configured = False
         self._state_before_hv = ControllerState.SAFE
+        self._snapshot_revision = 0
         self._closed = False
 
     @property
@@ -1432,6 +1498,14 @@ class KeithleyController:
     def list_resources(self) -> Tuple[str, ...]:
         return self._worker.list_resources()
 
+    def release_front_panel(self) -> bool:
+        """Return the GPIB instrument to local/front-panel control."""
+
+        with self._operation_lock:
+            if not self.connected:
+                return False
+            return bool(self._worker.go_to_local())
+
     def _ensure_manager(self) -> Any:
         raise StateError(
             "O ResourceManager não é exposto; use controller.list_resources()."
@@ -1474,21 +1548,18 @@ class KeithleyController:
             self._state_machine.transition(
                 ControllerState.CONNECTED, "*IDN? detectou " + profile.model
             )
-            try:
-                self._worker.execute(lambda inst: _instrument_write(inst, "*CLS"))
-                self._safe_shutdown_transaction()
-                self._state_machine.transition(
-                    ControllerState.SAFE, "inicialização defensiva"
-                )
-            except BaseException as error:
-                self._mark_communication_error(error)
-                try:
-                    self._worker.close_resource()
-                finally:
-                    self._state_machine.transition(
-                        ControllerState.DISCONNECTED, "conexão falhou"
-                    )
-                raise
+            # Observer mode is the default: opening a session must not clear
+            # status, abort a trigger, alter Zero Check or touch the source.
+            # SAFE means the session is accepted for explicit operations; it
+            # does not imply that the instrument was reconfigured.
+            self._hv_enabled_by_application = False
+            self._voltage_source_configured = False
+            self._configured_voltage_limit = None
+            self._configured_function = ""
+            self._state_machine.transition(
+                ControllerState.SAFE, "conexão observadora sem escrita"
+            )
+            self._worker.go_to_local()
             return identity
 
     def _safe_shutdown_transaction(self) -> None:
@@ -1572,10 +1643,16 @@ class KeithleyController:
             if self.state == ControllerState.DISCONNECTED:
                 return
             try:
-                if self._worker.is_open and self._profile is not None:
-                    self._safe_shutdown_transaction()
+                # Only undo a dangerous state that this application enabled.
+                # Pre-existing panel settings remain the operator's property.
+                if (
+                    self._worker.is_open
+                    and self._profile is not None
+                    and self._hv_enabled_by_application
+                ):
+                    self.disable_voltage_source()
             except Exception:
-                logging.exception("Parada segura falhou durante desconexão.")
+                logging.exception("Falha desligando HV pertencente à aplicação.")
             finally:
                 try:
                     self._worker.close_resource()
@@ -1584,6 +1661,7 @@ class KeithleyController:
                     self._identity = ""
                     self._resource_name = None
                     self._hv_enabled = False
+                    self._hv_enabled_by_application = False
                     self._voltage_source_configured = False
                     self._state_machine.transition(
                         ControllerState.DISCONNECTED, "sessão VISA fechada"
@@ -1604,6 +1682,479 @@ class KeithleyController:
 
     def options(self) -> str:
         return self.query("*OPT?")
+
+    @staticmethod
+    def _normalise_average_type(value: str) -> str:
+        text = str(value).strip().upper()
+        if text.startswith("ADV"):
+            return "ADVanced"
+        if text.startswith("SCAL"):
+            return "SCALar"
+        return "NONE"
+
+    @staticmethod
+    def _normalise_average_mode(value: str) -> str:
+        text = str(value).strip().upper()
+        return "REPeat" if text.startswith("REP") else "MOVing"
+
+    @staticmethod
+    def _parse_count_response(value: str) -> float:
+        number = float(str(value).strip())
+        return math.inf if number >= 9.0e36 else number
+
+    def read_instrument_snapshot(self) -> InstrumentSnapshot:
+        """Read the current front-panel configuration without any writes."""
+
+        with self._operation_lock:
+            self._state_machine.require(
+                ControllerState.CONNECTED,
+                ControllerState.SAFE,
+                ControllerState.CONFIGURED,
+                ControllerState.ARMED,
+                ControllerState.ACQUIRING,
+                ControllerState.HV_ENABLED,
+                ControllerState.ERROR,
+            )
+            profile = self._require_profile()
+            errors: List[Tuple[str, str]] = []
+
+            def operation(instrument: Any) -> Dict[str, Any]:
+                def optional(
+                    command: str, converter: Callable[[str], Any]
+                ) -> Any:
+                    try:
+                        return converter(_instrument_query(instrument, command))
+                    except Exception as error:
+                        errors.append((command, str(error)))
+                        return None
+
+                function_raw = _instrument_query(
+                    instrument, ":SENSe:FUNCtion?"
+                )
+                function = SCPICommandBuilder.function_path(function_raw)
+                prefix = ":SENSe:{0}".format(function)
+                average_type_raw = optional(
+                    prefix + ":AVERage:TYPE?", str
+                )
+                average_mode_raw = optional(
+                    prefix + ":AVERage:TCONtrol?", str
+                )
+                arm_count = optional(
+                    ":ARM:LAYer1:COUNt?", self._parse_count_response
+                )
+                repeat_count = None
+                if arm_count is not None:
+                    repeat_count = (
+                        math.inf if math.isinf(arm_count) else max(0.0, arm_count - 1.0)
+                    )
+                return {
+                    "function": function,
+                    "auto_range": optional(
+                        prefix + ":RANGe:AUTO?", _parse_scpi_bool
+                    ),
+                    "range_value": optional(prefix + ":RANGe?", float),
+                    "nplc": optional(prefix + ":NPLCycles?", float),
+                    "digits": optional(prefix + ":DIGits?", lambda raw: int(float(raw))),
+                    "aperture_s": optional(prefix + ":APERture?", float),
+                    "zero_check": optional(
+                        ":SYSTem:ZCHeck?", _parse_scpi_bool
+                    ),
+                    "zero_correct": optional(
+                        ":SYSTem:ZCORrect?", _parse_scpi_bool
+                    ),
+                    "rel_enabled": optional(
+                        prefix + ":REFerence:STATe?", _parse_scpi_bool
+                    ),
+                    "rel_value": optional(prefix + ":REFerence?", float),
+                    "average_enabled": optional(
+                        prefix + ":AVERage:STATe?", _parse_scpi_bool
+                    ),
+                    "average_type": (
+                        self._normalise_average_type(average_type_raw)
+                        if average_type_raw is not None
+                        else ""
+                    ),
+                    "average_mode": (
+                        self._normalise_average_mode(average_mode_raw)
+                        if average_mode_raw is not None
+                        else ""
+                    ),
+                    "average_count": optional(
+                        prefix + ":AVERage:COUNt?", lambda raw: int(float(raw))
+                    ),
+                    "advanced_noise_tolerance": optional(
+                        prefix + ":AVERage:ADVanced:NTOLerance?", float
+                    ),
+                    "median_enabled": optional(
+                        prefix + ":MEDian:STATe?", _parse_scpi_bool
+                    ),
+                    "median_rank": optional(
+                        prefix + ":MEDian:RANK?", lambda raw: int(float(raw))
+                    ),
+                    "line_sync": optional(
+                        ":SYSTem:LSYNc:STATe?", _parse_scpi_bool
+                    ),
+                    "source_sweep_points": optional(
+                        ":TRIGger:COUNt?", self._parse_count_response
+                    ),
+                    "repeat_count": repeat_count,
+                    "source_measure_delay_s": optional(
+                        ":TRIGger:DELay?", float
+                    ),
+                    "hv_output_enabled": optional(
+                        ":OUTPut1:STATe?", _parse_scpi_bool
+                    ),
+                }
+
+            try:
+                values = self._worker.execute(operation)
+            except BaseException as error:
+                self._mark_communication_error(error)
+                raise
+            finally:
+                # A snapshot is observational.  Release REMOTE immediately so
+                # the operator can continue using the physical front panel.
+                self._worker.go_to_local()
+
+            self._snapshot_revision += 1
+            snapshot = InstrumentSnapshot(
+                revision=self._snapshot_revision,
+                captured_at=time.time(),
+                model=profile.model,
+                resource_name=self._resource_name or "",
+                query_errors=tuple(errors),
+                **values,
+            )
+            self._configured_function = snapshot.function
+            if snapshot.nplc is not None:
+                self._configured_nplc = snapshot.nplc
+            self._hv_enabled = bool(snapshot.hv_output_enabled)
+            if self._hv_enabled and self.state in (
+                ControllerState.SAFE,
+                ControllerState.CONFIGURED,
+            ):
+                self._state_before_hv = self.state
+                self._state_machine.transition(
+                    ControllerState.HV_ENABLED, "HV preexistente lida do instrumento"
+                )
+            elif not self._hv_enabled and self.state == ControllerState.HV_ENABLED:
+                self._state_machine.transition(
+                    self._state_before_hv, "standby lido do instrumento"
+                )
+            elif (
+                snapshot.hv_output_enabled is False
+                and self.state == ControllerState.SAFE
+                and bool(snapshot.function)
+                and snapshot.nplc is not None
+            ):
+                # A complete observer snapshot is sufficient to use the
+                # front-panel setup for an explicit acquisition.  CONFIGURED
+                # means "known and usable" here; no setting was written.
+                self._state_machine.transition(
+                    ControllerState.CONFIGURED,
+                    "configuração do painel adotada sem escrita",
+                )
+            return snapshot
+
+    @staticmethod
+    def _different(left: Any, right: Any) -> bool:
+        if isinstance(left, (float, int)) and isinstance(right, (float, int)):
+            if math.isinf(float(left)) or math.isinf(float(right)):
+                return not (math.isinf(float(left)) and math.isinf(float(right)))
+            return not math.isclose(
+                float(left), float(right), rel_tol=1e-9, abs_tol=1e-12
+            )
+        return left != right
+
+    def apply_advanced_changes(
+        self, changes: Mapping[str, Any]
+    ) -> InstrumentSnapshot:
+        """Write only explicit draft deltas and confirm them by a new snapshot."""
+
+        if not changes:
+            return self.read_instrument_snapshot()
+        with self._operation_lock:
+            self._state_machine.require(
+                ControllerState.SAFE, ControllerState.CONFIGURED
+            )
+            profile = self._require_profile()
+            current = self.read_instrument_snapshot()
+            if current.hv_output_enabled:
+                raise StateError(
+                    "Não altere parâmetros de medição enquanto a fonte HV estiver ativa."
+                )
+            desired_function = SCPICommandBuilder.function_path(
+                str(changes.get("function", current.function))
+            )
+            function_changed = desired_function != current.function
+            if function_changed and current.zero_check is None:
+                raise StateError(
+                    "A troca de função foi bloqueada porque Zero Check não pôde ser consultado."
+                )
+
+            nplc = float(changes.get("nplc", current.nplc or 1.0))
+            if not 0.01 <= nplc <= 10.0:
+                raise ValueError("NPLC deve estar entre 0,01 e 10.")
+            digits = int(changes.get("digits", current.digits or 6))
+            if not 4 <= digits <= 7:
+                raise ValueError("Dígitos deve estar entre 4 e 7.")
+            average_count = int(
+                changes.get("average_count", current.average_count or 10)
+            )
+            if not 1 <= average_count <= 100:
+                raise ValueError("A média deve usar de 1 a 100 leituras.")
+            median_rank = int(changes.get("median_rank", current.median_rank or 1))
+            if not 1 <= median_rank <= 5:
+                raise ValueError("Rank da mediana deve estar entre 1 e 5.")
+            noise = float(
+                changes.get(
+                    "advanced_noise_tolerance",
+                    current.advanced_noise_tolerance or 1.0,
+                )
+            )
+            if not 0.0 <= noise <= 100.0:
+                raise ValueError("Janela de ruído deve estar entre 0 e 100%.")
+            points = changes.get("source_sweep_points")
+            if points is not None and not 1 <= int(points) <= 99999:
+                raise ValueError("Pontos devem estar entre 1 e 99999.")
+            repeats = changes.get("repeat_count")
+            if repeats is not None and not 0 <= int(repeats) <= 99998:
+                raise ValueError("Repetição deve estar entre 0 e 99998.")
+            delay = changes.get("source_measure_delay_s")
+            if delay is not None and not 0.0 <= float(delay) <= 999999.999:
+                raise ValueError("Atraso deve estar entre 0 e 999999,999 s.")
+
+            def operation(instrument: Any) -> None:
+                commands: List[str] = []
+                transient_zero_check = function_changed and current.zero_check is False
+                desired_zero_check = bool(
+                    changes.get("zero_check", current.zero_check)
+                )
+                if transient_zero_check:
+                    commands.append(profile.zero_check_on)
+                if function_changed:
+                    commands.append(
+                        ":SENSe:FUNCtion '{0}'".format(desired_function)
+                    )
+                prefix = ":SENSe:{0}".format(desired_function)
+
+                if "auto_range" in changes:
+                    commands.append(
+                        prefix
+                        + ":RANGe:AUTO "
+                        + ("ON" if bool(changes["auto_range"]) else "OFF")
+                    )
+                auto_range = bool(changes.get("auto_range", current.auto_range))
+                if "range_value" in changes and not auto_range:
+                    range_value = float(changes["range_value"])
+                    if range_value <= 0:
+                        raise ValueError("Faixa manual deve ser positiva.")
+                    maximum_range = {
+                        "VOLTage:DC": 210.0,
+                        "CURRent:DC": 21.0e-3,
+                        "RESistance": 100.0e18,
+                        "CHARge": 2.1e-6,
+                    }[desired_function]
+                    if range_value > maximum_range:
+                        raise ValueError(
+                            "Faixa manual excede {0:g} para {1}.".format(
+                                maximum_range, desired_function
+                            )
+                        )
+                    commands.append(
+                        prefix + ":RANGe:UPPer {0:.9E}".format(range_value)
+                    )
+                if "nplc" in changes:
+                    commands.append(prefix + ":NPLCycles {0:g}".format(nplc))
+                if "digits" in changes:
+                    commands.append(prefix + ":DIGits {0}".format(digits))
+                if "source_sweep_points" in changes:
+                    commands.append(":TRIGger:COUNt {0}".format(int(points)))
+                if "repeat_count" in changes:
+                    commands.append(
+                        ":ARM:LAYer1:COUNt {0}".format(int(repeats) + 1)
+                    )
+                if "source_measure_delay_s" in changes:
+                    commands.append(
+                        ":TRIGger:DELay {0:.9g}".format(float(delay))
+                    )
+                if "zero_correct" in changes:
+                    commands.append(
+                        ":SYSTem:ZCORrect:STATe "
+                        + ("ON" if bool(changes["zero_correct"]) else "OFF")
+                    )
+                if "rel_value" in changes:
+                    commands.append(
+                        prefix
+                        + ":REFerence {0:.12E}".format(float(changes["rel_value"]))
+                    )
+                if "rel_enabled" in changes:
+                    # A 6517A may report "Data corrupt or stale" when REL is
+                    # enabled after an acquisition abort, even though the
+                    # cached reference can still be queried.  Rewriting that
+                    # value marks it valid before STATE ON.
+                    if bool(changes["rel_enabled"]) and "rel_value" not in changes:
+                        if current.rel_value is None or not math.isfinite(
+                            float(current.rel_value)
+                        ):
+                            raise StateError(
+                                "Informe uma referência REL válida ou use Adquirir REL."
+                            )
+                        commands.append(
+                            prefix
+                            + ":REFerence {0:.12E}".format(float(current.rel_value))
+                        )
+                    commands.append(
+                        prefix
+                        + ":REFerence:STATe "
+                        + ("ON" if bool(changes["rel_enabled"]) else "OFF")
+                    )
+                if "average_type" in changes:
+                    commands.append(
+                        prefix
+                        + ":AVERage:TYPE "
+                        + self._normalise_average_type(str(changes["average_type"]))
+                    )
+                if "average_mode" in changes:
+                    commands.append(
+                        prefix
+                        + ":AVERage:TCONtrol "
+                        + self._normalise_average_mode(str(changes["average_mode"]))
+                    )
+                if "average_count" in changes:
+                    commands.append(
+                        prefix + ":AVERage:COUNt {0}".format(average_count)
+                    )
+                if "advanced_noise_tolerance" in changes:
+                    commands.append(
+                        prefix
+                        + ":AVERage:ADVanced:NTOLerance {0:g}".format(noise)
+                    )
+                if "average_enabled" in changes:
+                    commands.append(
+                        prefix
+                        + ":AVERage:STATe "
+                        + ("ON" if bool(changes["average_enabled"]) else "OFF")
+                    )
+                if "median_rank" in changes:
+                    commands.append(prefix + ":MEDian:RANK {0}".format(median_rank))
+                if "median_enabled" in changes:
+                    commands.append(
+                        prefix
+                        + ":MEDian:STATe "
+                        + ("ON" if bool(changes["median_enabled"]) else "OFF")
+                    )
+
+                if "zero_check" in changes or transient_zero_check:
+                    commands.append(
+                        profile.zero_check_on
+                        if desired_zero_check
+                        else profile.zero_check_off
+                    )
+                for command in commands:
+                    _instrument_write(instrument, command)
+                _raise_instrument_errors(instrument, profile)
+
+            try:
+                self._worker.execute(operation)
+            except BaseException as error:
+                self._mark_communication_error(error)
+                raise
+            self._configured_function = desired_function
+            self._configured_nplc = nplc
+            if self.state == ControllerState.SAFE:
+                self._state_machine.transition(
+                    ControllerState.CONFIGURED, "delta avançado confirmado"
+                )
+            return self.read_instrument_snapshot()
+
+    def acquire_zero_correct(self) -> InstrumentSnapshot:
+        with self._operation_lock:
+            current = self.read_instrument_snapshot()
+            if current.zero_check is not True:
+                raise StateError("Ative Zero Check antes de adquirir Zero Correct.")
+            profile = self._require_profile()
+
+            def operation(instrument: Any) -> None:
+                _log_preexisting_errors(instrument, profile, "Zero Correct")
+                # This is the front-panel-equivalent method documented by
+                # Keithley.  Some 6517A firmware revisions return -200 for
+                # ZCORrect:ACQuire even with Zero Check enabled.  Cycling the
+                # state while Zero Check is ON deterministically reacquires
+                # and enables the correction without changing Zero Check.
+                _instrument_write(instrument, ":SYSTem:ZCORrect:STATe OFF")
+                _instrument_write(instrument, ":SYSTem:ZCORrect:STATe ON")
+                _raise_instrument_errors(instrument, profile)
+
+            self._worker.execute(operation)
+            confirmed = self.read_instrument_snapshot()
+            if confirmed.zero_correct is not True:
+                raise StateError(
+                    "O instrumento não confirmou Zero Correct após a aquisição."
+                )
+            return confirmed
+
+    def acquire_rel(self) -> InstrumentSnapshot:
+        with self._operation_lock:
+            current = self.read_instrument_snapshot()
+            if current.zero_check is not False:
+                raise StateError(
+                    "Desative Zero Check e aguarde uma leitura válida antes de adquirir REL."
+                )
+            prefix = ":SENSe:{0}".format(current.function)
+            profile = self._require_profile()
+
+            def disable_previous_reference(instrument: Any) -> None:
+                _log_preexisting_errors(instrument, profile, "REL")
+                _instrument_write(instrument, prefix + ":REFerence:STATe OFF")
+                _raise_instrument_errors(instrument, profile)
+
+            self._worker.execute(disable_previous_reference)
+            reading = self.one_shot_read()
+            if reading.status != ReadingStatus.OK or not math.isfinite(reading.value):
+                raise StateError(
+                    "REL requer uma leitura válida; estado recebido: {0}.".format(
+                        reading.status.value
+                    )
+                )
+
+            def operation(instrument: Any) -> None:
+                # Firmware C05/A02 rejects REFerence:ACQuire with -200 after
+                # an abort.  Programming the just-measured value is the
+                # deterministic equivalent of using the front-panel REL key.
+                _instrument_write(
+                    instrument,
+                    prefix + ":REFerence {0:.12E}".format(reading.value),
+                )
+                _instrument_write(instrument, prefix + ":REFerence:STATe ON")
+                _raise_instrument_errors(instrument, profile)
+
+            self._worker.execute(operation)
+            confirmed = self.read_instrument_snapshot()
+            if confirmed.rel_enabled is not True:
+                raise StateError("O instrumento não confirmou a ativação de REL.")
+            if confirmed.rel_value is None or not math.isclose(
+                float(confirmed.rel_value),
+                reading.value,
+                rel_tol=1e-6,
+                abs_tol=1e-15,
+            ):
+                raise StateError(
+                    "O valor REL confirmado difere da leitura adquirida."
+                )
+            return confirmed
+
+    def disable_rel(self) -> InstrumentSnapshot:
+        current = self.read_instrument_snapshot()
+        prefix = ":SENSe:{0}".format(current.function)
+        profile = self._require_profile()
+
+        def operation(instrument: Any) -> None:
+            _instrument_write(instrument, prefix + ":REFerence:STATe OFF")
+            _raise_instrument_errors(instrument, profile)
+
+        self._worker.execute(operation)
+        return self.read_instrument_snapshot()
 
     def clear_status(self) -> None:
         self.write("*CLS")
@@ -1858,6 +2409,7 @@ class KeithleyController:
                     ControllerState.HV_ENABLED, "fonte HV habilitada pela interface"
                 )
                 self._hv_enabled = True
+                self._hv_enabled_by_application = True
                 return status
             except BaseException as error:
                 try:
@@ -1877,6 +2429,7 @@ class KeithleyController:
                 except Exception:
                     logging.exception("Falha no desligamento HV compensatório.")
                 self._hv_enabled = False
+                self._hv_enabled_by_application = False
                 self._voltage_source_configured = False
                 self._mark_communication_error(error)
                 raise
@@ -1937,6 +2490,7 @@ class KeithleyController:
                         "A saída está em standby, mas o nível programado não foi zerado."
                     )
                 self._hv_enabled = False
+                self._hv_enabled_by_application = False
                 self._voltage_source_configured = False
                 self._configured_voltage_limit = None
                 if self.state == ControllerState.HV_ENABLED:
@@ -1946,6 +2500,7 @@ class KeithleyController:
                 return status
             except BaseException as error:
                 self._hv_enabled = False
+                self._hv_enabled_by_application = False
                 self._voltage_source_configured = False
                 self._configured_voltage_limit = None
                 self._mark_communication_error(error)
@@ -1996,6 +2551,10 @@ class KeithleyController:
             except BaseException as error:
                 self._mark_communication_error(error)
                 raise
+            finally:
+                # Status polling is observational; leave the physical panel
+                # usable when the application is idle.
+                self._worker.go_to_local()
 
     def _post_acquisition_state(self) -> ControllerState:
         return (
@@ -2111,6 +2670,76 @@ class KeithleyController:
         _instrument_write(instrument, profile.trace_element_command)
         _validate_format_contract(instrument, profile)
 
+    def _capture_acquisition_trigger_setup(self, instrument: Any) -> None:
+        """Remember panel trigger settings before temporary acquisition writes."""
+
+        if (
+            self._acquisition_restore_commands
+            or self._acquisition_restore_continuous is not None
+        ):
+            return
+        self._acquisition_restore_continuous = _parse_scpi_bool(
+            _instrument_query(instrument, ":INITiate:CONTinuous?")
+        )
+        fields = (
+            (":ARM:LAYer1:COUNt?", ":ARM:LAYer1:COUNt {0}"),
+            (":ARM:LAYer1:SOURce?", ":ARM:LAYer1:SOURce {0}"),
+            (":ARM:LAYer2:COUNt?", ":ARM:LAYer2:COUNt {0}"),
+            (":ARM:LAYer2:SOURce?", ":ARM:LAYer2:SOURce {0}"),
+            (":TRIGger:SOURce?", ":TRIGger:SOURce {0}"),
+            (":TRIGger:COUNt?", ":TRIGger:COUNt {0}"),
+            (":TRIGger:TIMer?", ":TRIGger:TIMer {0}"),
+            (":TRIGger:DELay?", ":TRIGger:DELay {0}"),
+        )
+        restore: List[str] = []
+        for query, template in fields:
+            value = _instrument_query(instrument, query).strip().strip("'\"")
+            if not value or re.fullmatch(r"[A-Za-z0-9+\.\-]+", value) is None:
+                raise KeithleyError(
+                    "Resposta inválida ao preservar configuração de trigger: "
+                    "{0} -> {1!r}.".format(query, value)
+                )
+            restore.append(template.format(value))
+        self._acquisition_restore_commands = tuple(restore)
+
+    def _finish_acquisition_on_instrument(
+        self, instrument: Any, profile: InstrumentProfile
+    ) -> None:
+        """Stop acquisition and leave the front-panel display updating."""
+
+        restore_commands = self._acquisition_restore_commands
+        try:
+            for command in SCPICommandBuilder.idle_commands():
+                _instrument_write(instrument, command)
+            _instrument_write(instrument, ":TRACe:FEED:CONTrol NEVer")
+            for command in restore_commands:
+                _instrument_write(instrument, command)
+            # A reset and the temporary finite-trigger setup leave continuous
+            # initiation OFF, which makes the 6517 front panel show dashes.
+            # The acquisition is the explicit point at which the user asks the
+            # application to resume measurements, so leave the instrument in
+            # continuous display mode after the run as well.  This changes no
+            # measurement parameter, correction, or mathematical setting.
+            _instrument_write(instrument, ":INITiate:CONTinuous ON")
+            _raise_instrument_errors(instrument, profile)
+        finally:
+            self._acquisition_restore_commands = ()
+            self._acquisition_restore_continuous = None
+
+    def _capture_continuous_state(self, instrument: Any) -> None:
+        if self._acquisition_restore_continuous is None:
+            self._acquisition_restore_continuous = _parse_scpi_bool(
+                _instrument_query(instrument, ":INITiate:CONTinuous?")
+            )
+
+    def _restore_continuous_state(self, instrument: Any) -> None:
+        restore_continuous = self._acquisition_restore_continuous
+        try:
+            if restore_continuous is True:
+                _instrument_write(instrument, ":INITiate:CONTinuous ON")
+        finally:
+            self._acquisition_restore_continuous = None
+
     def _should_check_compliance(self) -> bool:
         return self._hv_enabled or self._configured_function == "RESistance"
 
@@ -2126,17 +2755,22 @@ class KeithleyController:
             )
             try:
                 def operation(instrument: Any) -> Tuple[str, bool]:
-                    self._format_instrument(instrument, profile)
-                    for command in SCPICommandBuilder.idle_commands():
-                        _instrument_write(instrument, command)
-                    response = _instrument_query(instrument, ":READ?")
-                    compliance = False
-                    if self._should_check_compliance():
-                        compliance = _instrument_query(
-                            instrument, profile.compliance_query
-                        ).strip() in ("1", "+1", "ON")
-                    _raise_instrument_errors(instrument, profile)
-                    return response, compliance
+                    self._capture_continuous_state(instrument)
+                    try:
+                        _log_preexisting_errors(instrument, profile, "one-shot")
+                        self._format_instrument(instrument, profile)
+                        for command in SCPICommandBuilder.idle_commands():
+                            _instrument_write(instrument, command)
+                        response = _instrument_query(instrument, ":READ?")
+                        compliance = False
+                        if self._should_check_compliance():
+                            compliance = _instrument_query(
+                                instrument, profile.compliance_query
+                            ).strip() in ("1", "+1", "ON")
+                        _raise_instrument_errors(instrument, profile)
+                        return response, compliance
+                    finally:
+                        self._restore_continuous_state(instrument)
 
                 raw, compliance = self._worker.execute(operation)
                 self._state_machine.transition(
@@ -2165,6 +2799,8 @@ class KeithleyController:
             self._state_machine.transition(ControllerState.ARMED, "live armado")
             try:
                 def operation(instrument: Any) -> None:
+                    self._capture_acquisition_trigger_setup(instrument)
+                    _log_preexisting_errors(instrument, profile, "LIVE")
                     self._format_instrument(instrument, profile)
                     for command in SCPICommandBuilder.idle_commands():
                         _instrument_write(instrument, command)
@@ -2223,7 +2859,7 @@ class KeithleyController:
         if source.strip().upper() in ("TIMER", "TIM"):
             if timer_interval is None or not 0.001 <= timer_interval <= 99999.999:
                 raise ValueError(
-                    "Intervalo TIMer deve estar entre 0,001 e 99999,999 s."
+                    "Intervalo TIMer deve estar entre 0.001 e 99999.999 s."
                 )
         if delay is not None and not 0.0 <= delay <= 999999.999:
             raise ValueError("Delay deve estar entre 0 e 999999,999 s.")
@@ -2240,6 +2876,8 @@ class KeithleyController:
                 )
             try:
                 def operation(instrument: Any) -> None:
+                    self._capture_acquisition_trigger_setup(instrument)
+                    _log_preexisting_errors(instrument, profile, "BUFFER")
                     for command in SCPICommandBuilder.idle_commands():
                         _instrument_write(instrument, command)
                     self._format_instrument(instrument, profile)
@@ -2339,7 +2977,7 @@ class KeithleyController:
                         compliance = _instrument_query(
                             instrument, profile.compliance_query
                         ).strip() in ("1", "+1", "ON")
-                    _raise_instrument_errors(instrument, profile)
+                    self._finish_acquisition_on_instrument(instrument, profile)
                     return response, compliance
 
                 raw, compliance = self._worker.execute(operation)
@@ -2427,13 +3065,19 @@ class KeithleyController:
             profile = self._require_profile()
             try:
                 def operation(instrument: Any) -> None:
-                    for command in SCPICommandBuilder.idle_commands():
-                        _instrument_write(instrument, command)
-                    _instrument_write(instrument, ":TRACe:FEED:CONTrol NEVer")
-                    _raise_instrument_errors(instrument, profile)
+                    self._finish_acquisition_on_instrument(instrument, profile)
 
                 self._worker.execute(operation)
-                if self.state in (
+                if self.state == ControllerState.ERROR:
+                    target = self._post_acquisition_state()
+                    self._state_machine.transition(
+                        ControllerState.SAFE, "abort recuperou a comunicação"
+                    )
+                    if target != ControllerState.SAFE:
+                        self._state_machine.transition(
+                            target, "configuração preservada após abort"
+                        )
+                elif self.state in (
                     ControllerState.ARMED,
                     ControllerState.ACQUIRING,
                 ):

@@ -23,8 +23,10 @@ from PIL import Image
 
 try:
     from .keithley_6517_contracts import AppIntent, IntentKind, PageId, ViewState
+    from .runtime_paths import resource_root
 except ImportError:  # pragma: no cover - direct src execution compatibility
     from keithley_6517_contracts import AppIntent, IntentKind, PageId, ViewState
+    from runtime_paths import resource_root
 
 
 COLORS = {
@@ -74,8 +76,9 @@ FOOTER_NAV_ITEMS = (
     (PageId.SETTINGS, "gear-compact", "Configurações"),
 )
 
-ICON_ROOT = Path(__file__).resolve().parents[1] / "assets" / "icons" / "codicons" / "png"
-BRANDING_ROOT = Path(__file__).resolve().parents[1] / "assets" / "branding"
+ASSET_ROOT = resource_root()
+ICON_ROOT = ASSET_ROOT / "assets" / "icons" / "codicons" / "png"
+BRANDING_ROOT = ASSET_ROOT / "assets" / "branding"
 APP_ICON_PATH = BRANDING_ROOT / "keithley_6517_spectrum_icon.png"
 APP_ICON_ICO_PATH = BRANDING_ROOT / "keithley_6517_spectrum_icon.ico"
 WINDOWS_APP_ID = "RADInstruments.Keithley6517.ControlStudio"
@@ -89,12 +92,93 @@ FUNCTIONS = {
     "Carga": "CHARge",
 }
 
+TIME_UNIT_FACTORS = {
+    "s": 1.0,
+    "min": 60.0,
+    "h": 3600.0,
+}
+
 FUNCTION_FILENAME_PARTS = {
     "Corrente DC": "corrente_dc",
     "Tensão DC": "tensao_dc",
     "Resistência": "resistencia",
     "Carga": "carga",
 }
+
+PLOTTABLE_READING_STATUSES = frozenset(("OK", "COMPLIANCE"))
+
+
+def _reading_is_plottable(status: str) -> bool:
+    """Return whether a reading represents a numeric measurement."""
+
+    return str(status).strip().upper() in PLOTTABLE_READING_STATUSES
+
+
+def _format_reading_value(
+    value: Optional[float],
+    status: str,
+    unit: str = "",
+    zero_check: bool = False,
+) -> str:
+    """Keep instrument sentinels out of numeric displays."""
+
+    normalized_status = str(status).strip().upper()
+    if normalized_status == "INVALID":
+        return "Inválida — Zero Check ligado" if zero_check else "Inválida"
+    if normalized_status == "OVERLOAD":
+        return "Sobrecarga"
+    if normalized_status == "UNDERFLOW":
+        return "Abaixo da faixa"
+    if normalized_status == "ERROR":
+        return "Erro de leitura"
+    if value is None:
+        return "—"
+    if not math.isfinite(value):
+        return "Inválida"
+    suffix = " " + unit if unit else ""
+    return "{0:.8E}{1}".format(value, suffix)
+
+
+def _format_monitor_value(value: Any, unit: str = "") -> str:
+    """Format a read-only instrument parameter for the monitor page."""
+
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "Ligado" if value else "Desligado"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "∞"
+        text = "{0:.8g}".format(value)
+    else:
+        text = str(value)
+    return text + (" " + unit if unit else "")
+
+
+def _automatic_filename_parts(state: ViewState, mode: str) -> Tuple[str, ...]:
+    """Return the mode and function used in an automatic filename."""
+
+    snapshot = state.instrument_snapshot
+    function_path = snapshot.function or state.measurement_function
+    function_part = next(
+        (
+            FUNCTION_FILENAME_PARTS[name]
+            for name, path in FUNCTIONS.items()
+            if path == function_path
+        ),
+        "medicao",
+    )
+    mode_part = str(mode).strip().lower() or "acquisition"
+    return mode_part, function_part
+
+
+def _build_automatic_acquisition_filename(
+    state: ViewState, mode: str, when: Optional[datetime] = None
+) -> str:
+    stamp = when or datetime.now()
+    return "_".join(
+        _automatic_filename_parts(state, mode) + (stamp.strftime("%Y%m%d_%H%M%S"),)
+    ) + ".csv"
 
 
 class _Tooltip:
@@ -160,6 +244,7 @@ class Keithley6517UI(ctk.CTk):
     """Single CTk root that renders the complete operator interface."""
 
     POLL_MS = 50
+    MONITOR_MS = 2500
 
     @staticmethod
     def _work_area() -> Tuple[int, int, int, int]:
@@ -211,11 +296,13 @@ class Keithley6517UI(ctk.CTk):
         self._closing_requested = False
         self._preview_after_id: Optional[str] = None
         self._poll_after_id: Optional[str] = None
+        self._monitor_after_id: Optional[str] = None
         self._last_table_index = 0
         self._last_log_revision = -1
         self._last_output: Tuple[str, ...] = ()
         self._chart_points: List[Tuple[float, float, float, float, int]] = []
         self._chart_hover_index: Optional[int] = None
+        self._automatic_filename_signature: Optional[Tuple[str, ...]] = None
 
         self._build_sidebar()
         self._build_header()
@@ -225,6 +312,7 @@ class Keithley6517UI(ctk.CTk):
         self._apply_theme(initial_state.theme)
         self._render(initial_state)
         self._poll_after_id = self.after(self.POLL_MS, self._poll_application)
+        self._monitor_after_id = self.after(self.MONITOR_MS, self._poll_monitor)
 
     @staticmethod
     def _set_windows_app_id() -> None:
@@ -407,7 +495,7 @@ class Keithley6517UI(ctk.CTk):
                 dialog.iconbitmap(str(APP_ICON_ICO_PATH))
             except tk.TclError:
                 pass
-        dialog.title("Sobre — Keithley 6517 Control Studio")
+        dialog.title("Sobre")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.protocol("WM_DELETE_WINDOW", self._close_about)
@@ -764,7 +852,7 @@ class Keithley6517UI(ctk.CTk):
 
         brand_grid = ctk.CTkFrame(page, fg_color="transparent")
         brand_grid.grid(row=4, column=0, sticky="ew", padx=18)
-        brand_grid.grid_columnconfigure(0, weight=1, uniform="dashboard-branding")
+        brand_grid.grid_columnconfigure(0, weight=4, uniform="dashboard-branding")
         brand_grid.grid_columnconfigure(1, weight=1, uniform="dashboard-branding")
 
         brand_card = ctk.CTkFrame(
@@ -775,7 +863,7 @@ class Keithley6517UI(ctk.CTk):
             border_width=1,
             border_color=COLORS["border"],
         )
-        brand_card.grid(row=0, column=0, sticky="nsew", padx=(6, 4), pady=8)
+        brand_card.grid(row=0, column=0, sticky="nsew", padx=6, pady=8)
         brand_card.grid_propagate(False)
         brand_card.grid_columnconfigure(1, weight=1)
         brand_card.grid_rowconfigure(0, weight=1)
@@ -813,48 +901,34 @@ class Keithley6517UI(ctk.CTk):
 
         qr_card = ctk.CTkFrame(
             brand_grid,
+            width=320,
             height=164,
             corner_radius=6,
             fg_color=COLORS["surface"],
             border_width=1,
             border_color=COLORS["border"],
         )
-        qr_card.grid(row=0, column=1, sticky="nsew", padx=(4, 6), pady=8)
+        qr_card.grid(row=0, column=1, sticky="ne", padx=6, pady=8)
         qr_card.grid_propagate(False)
-        qr_card.grid_columnconfigure(0, weight=1, uniform="qr-content")
-        qr_card.grid_columnconfigure(1, weight=1, uniform="qr-content")
-        qr_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(
-            qr_card,
-            text="SITE DA RAD",
-            anchor="w",
-            text_color=COLORS["muted"],
-            font=ctk.CTkFont(size=11, weight="bold"),
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 2))
+        qr_card.grid_columnconfigure(0, weight=0, uniform="qr-content")
+        qr_card.grid_columnconfigure(1, weight=0, uniform="qr-content")
+        qr_card.grid_rowconfigure(0, weight=1)
         ctk.CTkLabel(
             qr_card,
             text="",
             image=self._branding_images["qr"],
-        ).grid(row=1, column=0, rowspan=2, sticky="nsew", padx=(16, 12), pady=(0, 12))
-        ctk.CTkLabel(
-            qr_card,
-            text="Aponte a câmera do celular\npara acessar o site.",
-            anchor="w",
-            justify="left",
-            text_color=COLORS["text"],
-            font=ctk.CTkFont(size=11),
-        ).grid(row=1, column=1, sticky="sw", padx=(0, 12), pady=(0, 4))
+        ).grid(row=0, column=0, sticky="w", padx=(16, 12), pady=10)
         ctk.CTkButton(
             qr_card,
             text="Abrir site  ↗",
-            width=112,
+            width=100,
             height=28,
             corner_radius=4,
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._open_rad_website,
-        ).grid(row=2, column=1, sticky="nw", padx=(0, 12), pady=(0, 12))
+        ).place(relx=1.0, x=-16, rely=0.5, anchor="e")
 
     def _build_connection_page(self) -> None:
         page = self._page(PageId.CONNECTION)
@@ -875,9 +949,9 @@ class Keithley6517UI(ctk.CTk):
         self.expected_model.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 14))
         self._label(card, "Recurso VISA/GPIB", 0, 1, text_color=COLORS["muted"])
         self.resource_combo = ctk.CTkComboBox(
-            card, values=["GPIB0::26::INSTR"], width=360
+            card, values=["GPIB0::27::INSTR"], width=360
         )
-        self.resource_combo.set("GPIB0::26::INSTR")
+        self.resource_combo.set("GPIB0::27::INSTR")
         self.resource_combo.grid(row=1, column=1, sticky="ew", padx=16, pady=(0, 14))
         actions = ctk.CTkFrame(card, fg_color="transparent")
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(2, 16))
@@ -916,61 +990,106 @@ class Keithley6517UI(ctk.CTk):
         page = self._page(PageId.MEASUREMENT)
         self._section_header(
             page,
-            "Configuração de medição",
-            "Toda receita define função, faixa, NPLC, dígitos e formato; resistência também fixa AUTO ou MAN.",
+            "Medição",
+            "Função e NPLC ajustáveis.",
         )
-        card = self._card(page, 1)
-        for column in range(3):
-            card.grid_columnconfigure(column, weight=1)
-        self._label(card, "Função", 0, 0, text_color=COLORS["muted"])
-        self.function_option = ctk.CTkOptionMenu(card, values=list(FUNCTIONS), command=self._function_changed)
-        self.function_option.set("Corrente DC")
-        self.function_option.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
-        self._label(card, "NPLC (0,01 a 10)", 0, 1, text_color=COLORS["muted"])
-        self.nplc_entry = ctk.CTkEntry(card, placeholder_text="1.0")
-        self.nplc_entry.insert(0, "1.0")
-        self.nplc_entry.grid(row=1, column=1, sticky="ew", padx=16, pady=(0, 12))
-        self._label(card, "Dígitos (4 a 7)", 0, 2, text_color=COLORS["muted"])
-        self.digits_option = ctk.CTkOptionMenu(card, values=["4", "5", "6", "7"])
-        self.digits_option.set("6")
-        self.digits_option.grid(row=1, column=2, sticky="ew", padx=16, pady=(0, 12))
+        self._build_measurement_controls(page, start_row=1)
 
-        self.auto_range_var = tk.BooleanVar(value=True)
-        self.auto_range_switch = ctk.CTkSwitch(
-            card, text="Autorange", variable=self.auto_range_var, command=self._range_mode_changed
+    def _build_measurement_controls(
+        self, page: ctk.CTkScrollableFrame, start_row: int
+    ) -> None:
+        state_card = self._card(page, start_row)
+        state_card.grid_columnconfigure(0, weight=1)
+        state_card.grid_columnconfigure(1, weight=1)
+        self._label(state_card, "PARÂMETROS DO INSTRUMENTO", 0, 0, text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold"))
+        state_actions = ctk.CTkFrame(state_card, fg_color="transparent")
+        state_actions.grid(
+            row=0,
+            column=1,
+            rowspan=3,
+            sticky="e",
+            padx=16,
+            pady=12,
         )
-        self.auto_range_switch.grid(row=2, column=0, sticky="w", padx=16, pady=12)
-        self._label(card, "Faixa manual", 2, 1, text_color=COLORS["muted"])
-        self.range_entry = ctk.CTkEntry(card, placeholder_text="Valor em unidade SI")
-        self.range_entry.grid(row=3, column=1, sticky="ew", padx=16, pady=(0, 12))
-        self._label(card, "Fonte para resistência", 2, 2, text_color=COLORS["muted"])
-        self.resistance_mode = ctk.CTkOptionMenu(card, values=["AUTO", "MAN"])
-        self.resistance_mode.set("AUTO")
-        self.resistance_mode.grid(row=3, column=2, sticky="ew", padx=16, pady=(0, 12))
-        self.resistance_notice = ctk.CTkLabel(
-            card,
-            text="AUTO seleciona a fonte automática. MAN exige análise adicional da fonte de resistência.",
-            anchor="w",
-            text_color=COLORS["warning"],
+        self.apply_measurement_button = ctk.CTkButton(
+            state_actions,
+            text="Aplicar parâmetros",
+            width=140,
+            command=self._configure_measurement,
         )
-        self.resistance_notice.grid(row=4, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
-        actions = ctk.CTkFrame(card, fg_color="transparent")
-        actions.grid(row=5, column=0, columnspan=3, sticky="ew", padx=16, pady=(4, 16))
-        self.apply_measurement_button = ctk.CTkButton(actions, text="Aplicar e confirmar", command=self._configure_measurement)
-        self.apply_measurement_button.grid(row=0, column=0, padx=(0, 8))
-        self.one_shot_button = ctk.CTkButton(
-            actions,
-            text="Leitura única",
+        self.apply_measurement_button.grid(row=0, column=1, padx=(8, 0))
+        self.reset_parameters_button = ctk.CTkButton(
+            state_actions,
+            text="Resetar parâmetros",
+            width=150,
             fg_color="transparent",
             border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text"],
-            hover_color=COLORS["hover"],
-            command=lambda: self._emit(IntentKind.ONE_SHOT),
+            border_color=COLORS["danger"],
+            text_color=COLORS["danger"],
+            hover_color=COLORS["danger_bg"],
+            command=self._reset_parameters,
         )
-        self.one_shot_button.grid(row=0, column=1, padx=8)
-        self._range_mode_changed()
-        self._function_changed("Corrente DC")
+        self.reset_parameters_button.grid(row=0, column=0)
+        self.advanced_sync_label = ctk.CTkLabel(state_card, text="Não sincronizado", anchor="w", text_color=COLORS["warning"])
+        self.advanced_sync_label.grid(row=1, column=0, sticky="w", padx=16, pady=(4, 4))
+        self.advanced_state_detail = ctk.CTkLabel(state_card, text="Conecte o instrumento.", anchor="w", justify="left", text_color=COLORS["text"])
+        self.advanced_state_detail.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 12))
+
+        measurement = self._card(page, start_row + 1)
+        for column in range(2):
+            measurement.grid_columnconfigure(column, weight=1)
+        self._label(measurement, "MEDIÇÃO", 0, 0, text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold"))
+        self._label(measurement, "Função", 1, 0, text_color=COLORS["muted"])
+        self._label(measurement, "NPLC (0.01 a 10)", 1, 1, text_color=COLORS["muted"])
+
+        corrections = self._card(page, start_row + 2)
+        for column in range(3):
+            corrections.grid_columnconfigure(column, weight=1)
+        self._label(corrections, "CORREÇÕES", 0, 0, text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold"))
+        self._label(corrections, "Zero Check", 1, 0, text_color=COLORS["muted"])
+        self.zero_check_value = ctk.CTkLabel(corrections, text="—", anchor="w", font=ctk.CTkFont(family="Cascadia Mono", size=12))
+        self.zero_check_value.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self._label(corrections, "Zero Correct", 1, 1, text_color=COLORS["muted"])
+        self.zero_correct_value = ctk.CTkLabel(corrections, text="—", anchor="w", font=ctk.CTkFont(family="Cascadia Mono", size=12))
+        self.zero_correct_value.grid(row=2, column=1, sticky="ew", padx=16, pady=(0, 10))
+        self._label(corrections, "REL", 1, 2, text_color=COLORS["muted"])
+        self.rel_enabled_value = ctk.CTkLabel(corrections, text="—", anchor="w", font=ctk.CTkFont(family="Cascadia Mono", size=12))
+        self.rel_enabled_value.grid(row=2, column=2, sticky="ew", padx=16, pady=(0, 10))
+        self.advanced_function_option = ctk.CTkOptionMenu(
+            measurement,
+            values=list(FUNCTIONS),
+            command=self._function_changed,
+        )
+        self.advanced_function_option.set(next(iter(FUNCTIONS)))
+        self.advanced_function_option.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.advanced_nplc_entry = ctk.CTkEntry(measurement)
+        self.advanced_nplc_entry.grid(row=2, column=1, sticky="ew", padx=16, pady=(0, 10))
+        self.advanced_nplc_entry.bind(
+            "<KeyRelease>",
+            lambda _event: self._advanced_edit(
+                "nplc", self.advanced_nplc_entry.get()
+            ),
+            add="+",
+        )
+        def monitor_value(parent: Any, title: str, row: int, column: int) -> ctk.CTkLabel:
+            self._label(parent, title, row, column, text_color=COLORS["muted"])
+            value = ctk.CTkLabel(parent, text="—", anchor="w", font=ctk.CTkFont(family="Cascadia Mono", size=12))
+            value.grid(row=row + 1, column=column, sticky="ew", padx=16, pady=(0, 10))
+            return value
+
+        self.rel_value_value = monitor_value(corrections, "Referência REL", 3, 2)
+        self._label(measurement, "Janela de medição", 3, 0, text_color=COLORS["muted"])
+        self.advanced_measure_window = ctk.CTkLabel(measurement, text="—", anchor="w", font=ctk.CTkFont(family="Cascadia Mono", size=12))
+        self.advanced_measure_window.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 10))
+
+        math_card = self._card(page, start_row + 3)
+        for column in range(2):
+            math_card.grid_columnconfigure(column, weight=1)
+        self._label(math_card, "PARÂMETROS MATEMÁTICOS", 0, 0, text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold"))
+        self.average_enabled_value = monitor_value(math_card, "Filtro digital", 1, 0)
+        self.average_type_value = monitor_value(math_card, "Tipo", 1, 1)
+        self.noise_tolerance_value = monitor_value(math_card, "Janela de ruído (%)", 3, 0)
+        self.median_enabled_value = monitor_value(math_card, "Filtro de mediana", 3, 1)
 
     def _build_acquisition_page(self) -> None:
         page = self._page(PageId.ACQUISITION)
@@ -982,7 +1101,7 @@ class Keithley6517UI(ctk.CTk):
         controls = self._card(page, 1)
         for column in range(4):
             controls.grid_columnconfigure(column, weight=1)
-        labels = ("Modo", "Tempo de leitura (s)", "Intervalo (s)")
+        labels = ("Modo", "Tempo de leitura", "Intervalo", "Timeout")
         for column, label in enumerate(labels):
             self._label(controls, label, 0, column, text_color=COLORS["muted"])
         self._acquisition_name_automatic = True
@@ -993,19 +1112,24 @@ class Keithley6517UI(ctk.CTk):
         )
         self.acquisition_mode.set("LIVE")
         self.acquisition_mode.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
-        self.duration_entry = ctk.CTkEntry(controls)
-        self.duration_entry.insert(0, "10")
-        self.duration_entry.grid(row=1, column=1, sticky="ew", padx=16, pady=(0, 12))
-        self.interval_option = ctk.CTkOptionMenu(
+        self._acquisition_units = {
+            "duration": "s",
+            "interval": "s",
+            "timeout": "s",
+        }
+        self._build_time_control(controls, "duration", "10", 1)
+        self._build_time_control(
             controls,
-            values=["{0:.1f}".format(value / 10.0) for value in range(1, 11)],
+            "interval",
+            "0.1",
+            2,
+            placeholder_text="0.001 a 99999.999 s",
         )
-        self.interval_option.set("0.1")
-        self.interval_option.grid(row=1, column=2, sticky="ew", padx=16, pady=(0, 12))
-        self._label(controls, "Nome do arquivo CSV", 2, 0, text_color=COLORS["muted"])
+        self._build_time_control(controls, "timeout", "60", 3)
+        self._label(controls, "Nome do arquivo de saída", 2, 0, text_color=COLORS["muted"])
         self.file_entry = ctk.CTkEntry(
             controls,
-            placeholder_text="Nome automático conforme o modo; você pode editar",
+            placeholder_text="Nome automático conforme modo e função; você pode editar",
         )
         self.file_entry.grid(row=3, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
         self.file_entry.bind("<KeyRelease>", self._acquisition_filename_edited, add="+")
@@ -1250,46 +1374,131 @@ class Keithley6517UI(ctk.CTk):
         self._emit(IntentKind.DISCONNECT)
 
     def _configure_measurement(self) -> None:
-        self._emit(
-            IntentKind.CONFIGURE_MEASUREMENT,
-            function=FUNCTIONS[self.function_option.get()],
-            auto_range=self.auto_range_var.get(),
-            range_value=self.range_entry.get(),
-            nplc=self.nplc_entry.get(),
-            digits=self.digits_option.get(),
-            resistance_vsource_mode=self.resistance_mode.get(),
-        )
+        self._emit(IntentKind.APPLY_ADVANCED_CHANGES)
+
+    def _reset_parameters(self) -> None:
+        if not messagebox.askyesno(
+            "Resetar parâmetros",
+            "Isso enviará *RST ao Keithley e restaurará os parâmetros padrão. "
+            "A configuração atual de medição será perdida. Deseja continuar?",
+            icon="warning",
+            default=messagebox.NO,
+            parent=self,
+        ):
+            return
+        self._emit(IntentKind.RESET_INSTRUMENT)
+
+    def _advanced_edit(self, field: str, value: Any) -> None:
+        text = "1" if value is True else ("0" if value is False else str(value))
+        self._emit(IntentKind.EDIT_ADVANCED_DRAFT, field=field, value=text)
+
+    @staticmethod
+    def _set_entry_value(entry: ctk.CTkEntry, value: str) -> None:
+        if entry.get() == value:
+            return
+        state = entry.cget("state")
+        if state == "disabled":
+            entry.configure(state="normal")
+        entry.delete(0, "end")
+        entry.insert(0, value)
+        if state == "disabled":
+            entry.configure(state="disabled")
+
+    @staticmethod
+    def _set_widget_state(widget: Any, desired_state: str) -> None:
+        """Avoid redrawing CTk widgets when their state did not change."""
+
+        if str(widget.cget("state")) != desired_state:
+            widget.configure(state=desired_state)
 
     def _function_changed(self, value: str) -> None:
         self._measurement_function_name = value
-        is_resistance = value == "Resistência"
-        self.resistance_mode.configure(state="normal" if is_resistance else "disabled")
-        self.resistance_notice.configure(text_color=COLORS["warning"] if is_resistance else COLORS["muted"])
-        if hasattr(self, "file_entry"):
-            self._set_default_acquisition_filename(self.acquisition_mode.get())
-
-    def _range_mode_changed(self) -> None:
-        self.range_entry.configure(state="disabled" if self.auto_range_var.get() else "normal")
+        if value in FUNCTIONS:
+            self._advanced_edit("function", FUNCTIONS[value])
 
     def _automatic_acquisition_filename(self, mode: str) -> str:
-        function_name = getattr(self, "_measurement_function_name", "Corrente DC")
-        function_part = FUNCTION_FILENAME_PARTS.get(function_name, "medicao")
-        return "{0}_{1}.csv".format(
-            "{0}_{1}".format(
-                str(mode).strip().lower() or "acquisition",
-                function_part,
-            ),
-            datetime.now().strftime("%Y%m%d_%H%M%S"),
-        )
+        return _build_automatic_acquisition_filename(self.current_state, mode)
 
-    def _set_default_acquisition_filename(self, mode: str) -> None:
+    def _set_default_acquisition_filename(self, mode: str, force: bool = False) -> None:
         if not self._acquisition_name_automatic:
             return
+        signature = _automatic_filename_parts(self.current_state, mode)
+        if not force and signature == self._automatic_filename_signature:
+            return
+        self._automatic_filename_signature = signature
         self.file_entry.delete(0, "end")
         self.file_entry.insert(0, self._automatic_acquisition_filename(mode))
 
     def _acquisition_filename_edited(self, _event: Any = None) -> None:
         self._acquisition_name_automatic = False
+
+    def _build_time_control(
+        self,
+        parent: ctk.CTkFrame,
+        field: str,
+        default: str,
+        column: int,
+        placeholder_text: str = "",
+    ) -> None:
+        """Build a numeric time input with a unit selector beside it."""
+
+        container = ctk.CTkFrame(parent, fg_color="transparent")
+        container.grid(
+            row=1,
+            column=column,
+            sticky="ew",
+            padx=16,
+            pady=(0, 12),
+        )
+        container.grid_columnconfigure(0, weight=1)
+        entry = ctk.CTkEntry(container, placeholder_text=placeholder_text)
+        entry.insert(0, default)
+        entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        unit = ctk.CTkOptionMenu(
+            container,
+            values=list(TIME_UNIT_FACTORS),
+            width=72,
+            command=lambda value, name=field: self._acquisition_unit_changed(
+                name, value
+            ),
+        )
+        unit.set("s")
+        unit.grid(row=0, column=1, sticky="e")
+        setattr(self, "{0}_entry".format(field), entry)
+        setattr(self, "{0}_unit".format(field), unit)
+
+    def _acquisition_unit_changed(self, field: str, new_unit: str) -> None:
+        """Convert the displayed value when an acquisition unit changes."""
+
+        old_unit = self._acquisition_units[field]
+        if old_unit == new_unit:
+            return
+        entry = getattr(self, "{0}_entry".format(field))
+        raw_value = entry.get().strip().replace(",", ".")
+        try:
+            value = float(raw_value)
+        except ValueError:
+            value = None
+        if value is not None and math.isfinite(value):
+            seconds = value * TIME_UNIT_FACTORS[old_unit]
+            converted = seconds / TIME_UNIT_FACTORS[new_unit]
+            entry.delete(0, "end")
+            entry.insert(0, "{0:.12g}".format(converted))
+        self._acquisition_units[field] = new_unit
+
+    def _acquisition_value_in_seconds(self, field: str) -> str:
+        """Return an acquisition field converted to seconds for the app layer."""
+
+        entry = getattr(self, "{0}_entry".format(field))
+        raw_value = entry.get().strip()
+        try:
+            value = float(raw_value.replace(",", "."))
+        except ValueError:
+            return raw_value
+        if not math.isfinite(value):
+            return raw_value
+        seconds = value * TIME_UNIT_FACTORS[self._acquisition_units[field]]
+        return "{0:.12g}".format(seconds)
 
     def _acquisition_mode_changed(self, mode: str) -> None:
         self._set_default_acquisition_filename(mode)
@@ -1307,6 +1516,22 @@ class Keithley6517UI(ctk.CTk):
             subprocess.Popen(["explorer", str(folder)])
 
     def _start_acquisition(self) -> None:
+        if self.current_state.instrument_snapshot.zero_check is True:
+            messagebox.showwarning(
+                "Zero Check ligado",
+                "Desligue o Zero Check no painel do eletrometro antes de iniciar a aquisi\u00e7\u00e3o.\n\n"
+                "Com o Zero Check ligado, o 6517 n\u00e3o mede a entrada do circuito e as leituras ficam inv\u00e1lidas.",
+                parent=self,
+            )
+            return
+        if False:
+            messagebox.showwarning(
+                "Zero Check ligado",
+                "Desligue o Zero Check no painel do eletrometro antes de iniciar a aquisiÃ§Ã£o.\n\n"
+                "Com o Zero Check ligado, o 6517 nÃ£o mede a entrada do circuito e as leituras ficam invÃ¡lidas.",
+                parent=self,
+            )
+            return
         self._last_table_index = 0
         for item in self.reading_tree.get_children():
             self.reading_tree.delete(item)
@@ -1316,8 +1541,9 @@ class Keithley6517UI(ctk.CTk):
         self._emit(
             IntentKind.START_ACQUISITION,
             mode=mode,
-            duration=self.duration_entry.get(),
-            interval=self.interval_option.get(),
+            duration=self._acquisition_value_in_seconds("duration"),
+            interval=self._acquisition_value_in_seconds("interval"),
+            timeout=self._acquisition_value_in_seconds("timeout"),
             path=self.file_entry.get(),
             automatic_name=self._acquisition_name_automatic,
         )
@@ -1388,7 +1614,7 @@ class Keithley6517UI(ctk.CTk):
         self._emit(IntentKind.SHUTDOWN)
 
     def _cancel_own_timers(self) -> None:
-        for attribute in ("_preview_after_id", "_poll_after_id"):
+        for attribute in ("_preview_after_id", "_poll_after_id", "_monitor_after_id"):
             timer_id = getattr(self, attribute, None)
             if timer_id is not None:
                 try:
@@ -1409,10 +1635,26 @@ class Keithley6517UI(ctk.CTk):
             return
         self._poll_after_id = self.after(self.POLL_MS, self._poll_application)
 
+    def _poll_monitor(self) -> None:
+        self._monitor_after_id = None
+        state = self.current_state
+        if (
+            state.connected
+            and not state.busy
+            and not state.acquisition_running
+            and not state.panel_manual_mode
+            and not state.closing
+        ):
+            self._emit(IntentKind.MONITOR_INSTRUMENT)
+        if not state.closing:
+            self._monitor_after_id = self.after(self.MONITOR_MS, self._poll_monitor)
+
     def _render(self, state: ViewState) -> None:
         previous = self.current_state
         self.current_state = state
         if previous.acquisition_running and not state.acquisition_running and self._acquisition_name_automatic:
+            self._set_default_acquisition_filename(self.acquisition_mode.get(), force=True)
+        elif self._acquisition_name_automatic:
             self._set_default_acquisition_filename(self.acquisition_mode.get())
         if state.active_page != self._visible_page:
             self._show_page(state.active_page, dispatch=False)
@@ -1437,24 +1679,90 @@ class Keithley6517UI(ctk.CTk):
         self.dashboard_connection.configure(text=state.connection_status)
         self.dashboard_model.configure(text=state.detected_model)
         self.dashboard_hv.configure(text=state.hv_state, text_color=COLORS["danger"] if state.hv_active else COLORS["success"])
-        if state.reading_value is None:
-            reading_text = "—"
-        elif math.isfinite(state.reading_value):
-            reading_text = "{0:.8E} {1}".format(state.reading_value, state.reading_unit)
-        else:
-            reading_text = "Inválida"
+        reading_text = _format_reading_value(
+            state.reading_value,
+            state.reading_status,
+            state.reading_unit,
+            zero_check=state.instrument_snapshot.zero_check is True,
+        )
         self.dashboard_reading.configure(text=reading_text)
         self.dashboard_reading_meta.configure(text="Estado: {0}  ·  t = {1:.6g} s".format(state.reading_status, state.reading_timestamp))
         self.dashboard_safety.configure(text="HV: {0}. Interlock: {1}. Compliance: {2}.".format(state.hv_state, state.interlock_state, "ATIVA" if state.compliance else "não detectada"))
 
-        self.expected_model.configure(state="disabled" if state.connected else "normal")
+        snapshot = state.instrument_snapshot
+
+        sync_color = (
+            COLORS["success"]
+            if state.sync_status == "Sincronizado"
+            else (COLORS["danger"] if state.conflict_fields else COLORS["warning"])
+        )
+        self.advanced_sync_label.configure(text=state.sync_status, text_color=sync_color)
+        last_read = (
+            datetime.fromtimestamp(state.last_instrument_read).strftime("%H:%M:%S")
+            if state.last_instrument_read
+            else "—"
+        )
+        conflict_text = (
+            " · CONFLITO: "
+            + ", ".join(state.conflict_fields)
+            if state.conflict_fields
+            else (" · alteração manual detectada" if state.manual_change_detected else "")
+        )
+        self.advanced_state_detail.configure(
+            text="Última leitura {0} · {1}{2}".format(
+                last_read,
+                snapshot.function or "—",
+                conflict_text,
+            ),
+            text_color=COLORS["warning"] if conflict_text else COLORS["text"],
+        )
+
+        draft_values = dict(state.draft_values)
+        function_path = draft_values.get("function", snapshot.function)
+        function_name = next(
+            (name for name, path in FUNCTIONS.items() if path == function_path),
+            function_path or "—",
+        )
+        if function_name in FUNCTIONS and self.advanced_function_option.get() != function_name:
+            self.advanced_function_option.set(function_name)
+        nplc_text = draft_values.get(
+            "nplc",
+            _format_monitor_value(snapshot.nplc),
+        )
+        self._set_entry_value(self.advanced_nplc_entry, nplc_text)
+        self.advanced_measure_window.configure(
+            text=(
+                _format_monitor_value(snapshot.aperture_s * 1000.0, "ms")
+                if snapshot.aperture_s is not None
+                else "—"
+            )
+        )
+        self.zero_check_value.configure(text=_format_monitor_value(snapshot.zero_check))
+        self.zero_correct_value.configure(text=_format_monitor_value(snapshot.zero_correct))
+        self.rel_enabled_value.configure(text=_format_monitor_value(snapshot.rel_enabled))
+        self.rel_value_value.configure(text=_format_monitor_value(snapshot.rel_value))
+        self.average_enabled_value.configure(text=_format_monitor_value(snapshot.average_enabled))
+        self.average_type_value.configure(text=snapshot.average_type or "—")
+        self.noise_tolerance_value.configure(
+            text=_format_monitor_value(snapshot.advanced_noise_tolerance, "%")
+        )
+        self.median_enabled_value.configure(text=_format_monitor_value(snapshot.median_enabled))
+        self._set_widget_state(
+            self.expected_model, "disabled" if state.connected else "normal"
+        )
         expected_display = {"AUTO": "Automático", "6517A": "Keithley 6517A", "6517B": "Keithley 6517B"}.get(state.expected_model, "Automático")
         if self.expected_model.get() != expected_display:
             self.expected_model.set(expected_display)
         if state.available_resources:
-            self.resource_combo.configure(values=list(state.available_resources))
-            if not self.resource_combo.get() or self.resource_combo.get() in ("GPIB0::27::INSTR", "GPIB0::26::INSTR"):
-                self.resource_combo.set(state.available_resources[0])
+            available_resources = tuple(state.available_resources)
+            self.resource_combo.configure(values=list(available_resources))
+            if self.resource_combo.get() not in available_resources:
+                preferred_resource = "GPIB0::27::INSTR"
+                self.resource_combo.set(
+                    preferred_resource
+                    if preferred_resource in available_resources
+                    else available_resources[0]
+                )
         self.identity_labels["idn"].configure(text=state.identity or "—")
         self.identity_labels["serial"].configure(text=state.serial_number)
         self.identity_labels["firmware"].configure(text=state.firmware)
@@ -1462,19 +1770,47 @@ class Keithley6517UI(ctk.CTk):
         self.identity_labels["state"].configure(text=state.controller_state)
 
         can_connect = not state.connected and not state.busy and not state.closing
-        self.connect_button.configure(state="normal" if can_connect else "disabled")
-        self.discover_button.configure(state="normal" if can_connect else "disabled")
-        self.disconnect_button.configure(
-            state="normal"
-            if state.connected and not state.closing and not state.acquisition_running
-            else "disabled"
+        self._set_widget_state(
+            self.connect_button, "normal" if can_connect else "disabled"
         )
-        can_configure = state.connected and not state.busy and not state.acquisition_running and not state.hv_active
-        self.apply_measurement_button.configure(state="normal" if can_configure else "disabled")
-        self.one_shot_button.configure(state="normal" if state.measurement_configured and not state.busy and not state.acquisition_running else "disabled")
+        self._set_widget_state(
+            self.discover_button, "normal" if can_connect else "disabled"
+        )
+        self._set_widget_state(
+            self.disconnect_button,
+            "normal"
+            if state.connected and not state.closing and not state.acquisition_running
+            else "disabled",
+        )
+        can_configure = (
+            state.connected
+            and not state.busy
+            and not state.acquisition_running
+            and not state.hv_active
+        )
+        self._set_widget_state(
+            self.apply_measurement_button,
+            "normal" if can_configure and bool(state.dirty_fields) else "disabled",
+        )
+        can_reset = (
+            can_configure
+            and state.controller_state in ("Safe", "Configured")
+        )
+        self._set_widget_state(
+            self.reset_parameters_button,
+            "normal" if can_reset else "disabled",
+        )
+        self._set_widget_state(
+            self.advanced_function_option,
+            "normal" if can_configure else "disabled",
+        )
+        self._set_widget_state(
+            self.advanced_nplc_entry,
+            "normal" if can_configure else "disabled",
+        )
 
-        self.start_acquisition_button.configure(state="normal" if state.connected and state.measurement_configured and not state.acquisition_running and not state.busy else "disabled")
-        self.stop_acquisition_button.configure(state="normal" if state.acquisition_running else "disabled")
+        self._set_widget_state(self.start_acquisition_button, "normal" if state.connected and state.measurement_configured and not state.acquisition_running and not state.busy else "disabled")
+        self._set_widget_state(self.stop_acquisition_button, "normal" if state.acquisition_running else "disabled")
         target = max(1, state.acquisition_target)
         self.acquisition_progress.set(min(1.0, state.acquisition_count / target))
         self.acquisition_counter.configure(text="{0} / {1}".format(state.acquisition_count, state.acquisition_target))
@@ -1486,9 +1822,9 @@ class Keithley6517UI(ctk.CTk):
         self.hv_status_labels["limit"].configure(text="{0:g} V".format(state.hv_voltage_limit))
         self.hv_status_labels["interlock"].configure(text=state.interlock_state, text_color=COLORS["warning"] if "indeterminado" in state.interlock_state.lower() else COLORS["text"])
         self.hv_status_labels["compliance"].configure(text="DETECTADA" if state.compliance else "Não detectada", text_color=COLORS["danger"] if state.compliance else COLORS["text"])
-        self.configure_hv_button.configure(state="normal" if state.connected and not state.busy and not state.acquisition_running and not state.hv_active else "disabled")
-        self.enable_hv_button.configure(state="normal" if state.connected and state.hv_configured and not state.hv_active and not state.busy else "disabled")
-        self.disable_hv_button.configure(state="normal" if state.connected else "disabled")
+        self._set_widget_state(self.configure_hv_button, "normal" if state.connected and not state.busy and not state.acquisition_running and not state.hv_active else "disabled")
+        self._set_widget_state(self.enable_hv_button, "normal" if state.connected and state.hv_configured and not state.hv_active and not state.busy else "disabled")
+        self._set_widget_state(self.disable_hv_button, "normal" if state.connected else "disabled")
 
         preview = state.scpi_preview
         self.scpi_preview_title.configure(
@@ -1496,9 +1832,9 @@ class Keithley6517UI(ctk.CTk):
             text_color=COLORS["success"] if preview.valid and preview.risk == "NONE" else (COLORS["warning"] if preview.valid else COLORS["danger"]),
         )
         self.scpi_preview_detail.configure(text="{0}\n{1}".format(preview.summary, preview.manual_reference).strip())
-        self.scpi_confirm.configure(state="normal" if preview.confirmation_required else "disabled")
-        self.scpi_physical.configure(state="normal" if preview.risk == "HV_ENABLE" else "disabled")
-        self.execute_scpi_button.configure(state="normal" if state.connected and preview.valid and not state.busy and not state.acquisition_running else "disabled")
+        self._set_widget_state(self.scpi_confirm, "normal" if preview.confirmation_required else "disabled")
+        self._set_widget_state(self.scpi_physical, "normal" if preview.risk == "HV_ENABLE" else "disabled")
+        self._set_widget_state(self.execute_scpi_button, "normal" if state.connected and preview.valid and not state.busy and not state.acquisition_running else "disabled")
         self._render_scpi_output(state.scpi_output)
         self._render_logs(state)
         self.theme_option.set("Claro" if state.theme == "Light" else "Escuro")
@@ -1515,13 +1851,18 @@ class Keithley6517UI(ctk.CTk):
         for reading in state.readings:
             if reading.index <= self._last_table_index:
                 continue
+            value_text = _format_reading_value(
+                reading.value,
+                reading.status,
+                zero_check=state.instrument_snapshot.zero_check is True,
+            )
             self.reading_tree.insert(
                 "",
                 "end",
                 values=(
                     reading.index,
                     "{0:.6g}".format(reading.timestamp),
-                    "{0:.8E}".format(reading.value),
+                    value_text,
                     reading.unit,
                 ),
             )
@@ -1553,12 +1894,39 @@ class Keithley6517UI(ctk.CTk):
         readings = [
             reading
             for reading in state.readings
-            if math.isfinite(reading.value) and math.isfinite(reading.timestamp)
+            if (
+                _reading_is_plottable(reading.status)
+                and math.isfinite(reading.value)
+                and math.isfinite(reading.timestamp)
+            )
         ]
         values = [(reading.timestamp, reading.value) for reading in readings]
         if len(values) < 2:
             self._chart_hover_index = None
-            self.chart.create_text(width / 2, height / 2, text="Aguardando dados", fill="#808080")
+            invalid_count = sum(
+                1
+                for reading in state.readings
+                if not _reading_is_plottable(reading.status)
+            )
+            if invalid_count and state.instrument_snapshot.zero_check is True:
+                empty_text = (
+                    "Sem dados válidos para o gráfico\n"
+                    "Zero Check está ligado no instrumento"
+                )
+                empty_color = COLORS["warning"][1 if state.theme == "Dark" else 0]
+            elif invalid_count:
+                empty_text = "Sem dados válidos para o gráfico"
+                empty_color = COLORS["warning"][1 if state.theme == "Dark" else 0]
+            else:
+                empty_text = "Aguardando dados válidos"
+                empty_color = "#808080"
+            self.chart.create_text(
+                width / 2,
+                height / 2,
+                text=empty_text,
+                fill=empty_color,
+                justify="center",
+            )
             return
         minimum = min(value for _index, value in values)
         maximum = max(value for _index, value in values)

@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,7 +32,10 @@ from keithley_6517_driver import (  # noqa: E402
     parse_buffer_response,
     parse_reading_response,
 )
-from keithley_6517_storage import CsvAcquisitionWriter  # noqa: E402
+from keithley_6517_storage import (  # noqa: E402
+    CsvAcquisitionWriter,
+    export_csv_to_xlsx,
+)
 
 
 class FakeInterface:
@@ -79,8 +83,42 @@ class FakeInstrument:
         self.resistance_manual_amplitude = 100.0
         self.resistance_manual_range = 100.0
         self.measurement_function = "CURR"
+        self.auto_range = True
+        self.measurement_range = 2.0e-9
+        self.nplc = 1.0
+        self.digits = 6
+        self.aperture = 1.0 / 60.0
+        self.zero_check = True
+        self.zero_correct = False
+        self.rel_enabled = False
+        self.rel_value = 0.0
+        self.average_enabled = False
+        self.average_type = "SCAL"
+        self.average_mode = "MOV"
+        self.average_count = 10
+        self.noise_tolerance = 1.0
+        self.median_enabled = True
+        self.median_rank = 1
+        self.line_sync = False
+        self.trigger_count = 1
+        self.arm_count = 1
+        self.arm_source = "IMM"
+        self.arm2_count = 1
+        self.arm2_source = "IMM"
+        self.trigger_source = "IMM"
+        self.trigger_timer = 0.1
+        self.trigger_delay = 0.0
+        self.continuous_initiation = True
+        self.query_overrides: Dict[str, Any] = {}
         self.query_delay = 0.0
         self.closed = False
+        self.front_panel_local = False
+
+    def front_panel_set(self, **changes: Any) -> None:
+        for name, value in changes.items():
+            if not hasattr(self, name):
+                raise AttributeError(name)
+            setattr(self, name, value)
 
     def write(self, command: str) -> None:
         self.log.append(("write", command, threading.get_ident()))
@@ -123,6 +161,58 @@ class FakeInstrument:
             self.resistance_vsource_mode = command.rsplit(" ", 1)[1].upper()
         elif upper.startswith(":SENSE:FUNCTION "):
             self.measurement_function = command.rsplit(" ", 1)[1].strip("'\"").upper()
+        elif ":RANGE:AUTO " in upper:
+            self.auto_range = command.rsplit(" ", 1)[1].upper() in ("ON", "1")
+        elif ":RANGE:UPPER " in upper:
+            self.measurement_range = float(command.rsplit(" ", 1)[1])
+        elif ":NPLCYCLES " in upper:
+            self.nplc = float(command.rsplit(" ", 1)[1])
+            self.aperture = self.nplc / 60.0
+        elif ":DIGITS " in upper:
+            self.digits = int(float(command.rsplit(" ", 1)[1]))
+        elif upper.startswith(":SYSTEM:ZCHECK "):
+            self.zero_check = command.rsplit(" ", 1)[1].upper() in ("ON", "1")
+        elif upper.startswith(":SYSTEM:ZCORRECT:STATE "):
+            self.zero_correct = command.rsplit(" ", 1)[1].upper() in ("ON", "1")
+        elif ":REFERENCE:STATE " in upper:
+            self.rel_enabled = command.rsplit(" ", 1)[1].upper() in ("ON", "1")
+        elif ":REFERENCE " in upper:
+            self.rel_value = float(command.rsplit(" ", 1)[1])
+        elif ":AVERAGE:TYPE " in upper:
+            self.average_type = command.rsplit(" ", 1)[1]
+        elif ":AVERAGE:TCONTROL " in upper:
+            self.average_mode = command.rsplit(" ", 1)[1]
+        elif ":AVERAGE:COUNT " in upper:
+            self.average_count = int(float(command.rsplit(" ", 1)[1]))
+        elif ":AVERAGE:ADVANCED:NTOLERANCE " in upper:
+            self.noise_tolerance = float(command.rsplit(" ", 1)[1])
+        elif ":AVERAGE:STATE " in upper:
+            self.average_enabled = command.rsplit(" ", 1)[1].upper() in ("ON", "1")
+        elif ":MEDIAN:RANK " in upper:
+            self.median_rank = int(float(command.rsplit(" ", 1)[1]))
+        elif ":MEDIAN:STATE " in upper:
+            self.median_enabled = command.rsplit(" ", 1)[1].upper() in ("ON", "1")
+        elif upper.startswith(":TRIGGER:COUNT "):
+            self.trigger_count = int(float(command.rsplit(" ", 1)[1]))
+        elif upper.startswith(":ARM:LAYER1:COUNT "):
+            self.arm_count = int(float(command.rsplit(" ", 1)[1]))
+        elif upper.startswith(":ARM:LAYER1:SOURCE "):
+            self.arm_source = command.rsplit(" ", 1)[1].upper()
+        elif upper.startswith(":ARM:LAYER2:COUNT "):
+            self.arm2_count = int(float(command.rsplit(" ", 1)[1]))
+        elif upper.startswith(":ARM:LAYER2:SOURCE "):
+            self.arm2_source = command.rsplit(" ", 1)[1].upper()
+        elif upper.startswith(":TRIGGER:SOURCE "):
+            self.trigger_source = command.rsplit(" ", 1)[1].upper()
+        elif upper.startswith(":TRIGGER:TIMER "):
+            self.trigger_timer = float(command.rsplit(" ", 1)[1])
+        elif upper.startswith(":TRIGGER:DELAY "):
+            self.trigger_delay = float(command.rsplit(" ", 1)[1])
+        elif upper.startswith(":INITIATE:CONTINUOUS "):
+            self.continuous_initiation = command.rsplit(" ", 1)[1].upper() in (
+                "ON",
+                "1",
+            )
         elif upper.startswith(":SENSE:RESISTANCE:MANUAL:VSOURCE:OPERATE "):
             self.resistance_manual_operate = command.rsplit(" ", 1)[1].upper() in (
                 "ON",
@@ -140,6 +230,11 @@ class FakeInstrument:
         if self.query_delay:
             time.sleep(self.query_delay)
         upper = command.upper()
+        if upper in self.query_overrides:
+            override = self.query_overrides[upper]
+            if isinstance(override, BaseException):
+                raise override
+            return str(override)
         if upper == "*IDN?":
             return self.identity
         if upper == "*OPT?":
@@ -156,6 +251,58 @@ class FakeInstrument:
             return "+4.000000E-12,0.400000,N"
         if upper == ":SENSE:FUNCTION?":
             return '"' + self.measurement_function + '"'
+        if upper.startswith(":SENSE:") and ":MANUAL:" not in upper and upper.endswith(":RANGE:AUTO?"):
+            return "1" if self.auto_range else "0"
+        if upper.startswith(":SENSE:") and ":MANUAL:" not in upper and upper.endswith(":RANGE?"):
+            return str(self.measurement_range)
+        if upper.startswith(":SENSE:") and upper.endswith(":NPLCYCLES?"):
+            return str(self.nplc)
+        if upper.startswith(":SENSE:") and upper.endswith(":DIGITS?"):
+            return str(self.digits)
+        if upper.startswith(":SENSE:") and upper.endswith(":APERTURE?"):
+            return str(self.aperture)
+        if upper == ":SYSTEM:ZCHECK?":
+            return "1" if self.zero_check else "0"
+        if upper == ":SYSTEM:ZCORRECT?":
+            return "1" if self.zero_correct else "0"
+        if upper.endswith(":REFERENCE:STATE?"):
+            return "1" if self.rel_enabled else "0"
+        if upper.endswith(":REFERENCE?"):
+            return str(self.rel_value)
+        if upper.endswith(":AVERAGE:STATE?"):
+            return "1" if self.average_enabled else "0"
+        if upper.endswith(":AVERAGE:TYPE?"):
+            return self.average_type
+        if upper.endswith(":AVERAGE:TCONTROL?"):
+            return self.average_mode
+        if upper.endswith(":AVERAGE:COUNT?"):
+            return str(self.average_count)
+        if upper.endswith(":AVERAGE:ADVANCED:NTOLERANCE?"):
+            return str(self.noise_tolerance)
+        if upper.endswith(":MEDIAN:STATE?"):
+            return "1" if self.median_enabled else "0"
+        if upper.endswith(":MEDIAN:RANK?"):
+            return str(self.median_rank)
+        if upper == ":SYSTEM:LSYNC:STATE?":
+            return "1" if self.line_sync else "0"
+        if upper == ":TRIGGER:COUNT?":
+            return str(self.trigger_count)
+        if upper == ":ARM:LAYER1:COUNT?":
+            return str(self.arm_count)
+        if upper == ":ARM:LAYER1:SOURCE?":
+            return self.arm_source
+        if upper == ":ARM:LAYER2:COUNT?":
+            return str(self.arm2_count)
+        if upper == ":ARM:LAYER2:SOURCE?":
+            return self.arm2_source
+        if upper == ":TRIGGER:SOURCE?":
+            return self.trigger_source
+        if upper == ":TRIGGER:TIMER?":
+            return str(self.trigger_timer)
+        if upper == ":TRIGGER:DELAY?":
+            return str(self.trigger_delay)
+        if upper == ":INITIATE:CONTINUOUS?":
+            return "1" if self.continuous_initiation else "0"
         if upper == ":READ?":
             return self.read_response
         if upper == ":TRACE:POINTS:ACTUAL?":
@@ -193,6 +340,11 @@ class FakeInstrument:
     def close(self) -> None:
         self.log.append(("close", "resource", threading.get_ident()))
         self.closed = True
+
+    def control_ren(self, mode: Any) -> int:
+        self.log.append(("ren", str(int(mode)), threading.get_ident()))
+        self.front_panel_local = True
+        return 0
 
 
 class FakeResourceManager:
@@ -280,7 +432,7 @@ class ControllerFixture(unittest.TestCase):
         writes = [command for kind, command, _tid in instrument.log if kind == "write"]
         self.assertEqual(writes, [])
 
-    def test_connect_enters_safe_state_and_uses_worker_only(self) -> None:
+    def test_connect_observer_is_write_free_and_uses_worker_only(self) -> None:
         controller, instrument, manager = self.make_controller()
         identity = controller.connect("GPIB0::27::INSTR")
         self.assertIn("6517A", identity)
@@ -293,6 +445,217 @@ class ControllerFixture(unittest.TestCase):
         }
         self.assertEqual(access_threads, {owner})
         self.assertFalse(any(item[0] == "ifc" for item in manager.log))
+        self.assertEqual(
+            [command for kind, command, _tid in instrument.log if kind == "write"],
+            [],
+        )
+        self.assertTrue(instrument.front_panel_local)
+
+    def test_disconnect_sends_go_to_local_before_closing_gpib(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.front_panel_local = False
+        instrument.log.clear()
+
+        controller.disconnect()
+
+        operations = [(kind, command) for kind, command, _tid in instrument.log]
+        ren_index = next(
+            index for index, item in enumerate(operations) if item[0] == "ren"
+        )
+        close_index = operations.index(("close", "resource"))
+        self.assertLess(ren_index, close_index)
+        self.assertTrue(instrument.front_panel_local)
+        self.assertFalse(any(kind == "write" for kind, _command in operations))
+
+    def test_snapshot_releases_front_panel_without_scpi_write(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.front_panel_local = False
+        instrument.log.clear()
+
+        controller.read_instrument_snapshot()
+
+        self.assertTrue(instrument.front_panel_local)
+        self.assertTrue(any(kind == "ren" for kind, _command, _tid in instrument.log))
+        self.assertFalse(
+            any(kind == "write" for kind, _command, _tid in instrument.log)
+        )
+
+    def test_explicit_front_panel_release_uses_gtl_without_scpi_write(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.front_panel_local = False
+        instrument.log.clear()
+
+        self.assertTrue(controller.release_front_panel())
+        self.assertTrue(instrument.front_panel_local)
+        self.assertTrue(any(kind == "ren" for kind, _command, _tid in instrument.log))
+        self.assertFalse(
+            any(kind == "write" for kind, _command, _tid in instrument.log)
+        )
+
+    def test_read_only_snapshot_follows_front_panel_changes(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        first = controller.read_instrument_snapshot()
+        self.assertEqual(controller.state, ControllerState.CONFIGURED)
+        self.assertEqual(first.nplc, 1.0)
+        instrument.front_panel_set(
+            nplc=2.0,
+            aperture=2.0 / 60.0,
+            average_enabled=True,
+            average_count=25,
+        )
+        instrument.log.clear()
+        second = controller.read_instrument_snapshot()
+        self.assertEqual(second.nplc, 2.0)
+        self.assertTrue(second.average_enabled)
+        self.assertEqual(second.average_count, 25)
+        self.assertFalse(any(kind == "write" for kind, _command, _tid in instrument.log))
+
+    def test_observer_snapshot_enables_acquisition_without_configuration_write(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.log.clear()
+
+        snapshot = controller.read_instrument_snapshot()
+
+        self.assertEqual(snapshot.function, "CURRent:DC")
+        self.assertEqual(controller.state, ControllerState.CONFIGURED)
+        self.assertEqual(controller._configured_function, "CURRent:DC")
+        self.assertEqual(controller._configured_nplc, 1.0)
+        self.assertFalse(
+            any(kind == "write" for kind, _command, _tid in instrument.log)
+        )
+
+        controller.start_live()
+        self.assertEqual(controller.state, ControllerState.ACQUIRING)
+        controller.abort()
+
+    def test_snapshot_keeps_valid_fields_when_one_response_is_invalid(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.query_overrides[":SENSE:CURRENT:DC:NPLCYCLES?"] = "inválido"
+        snapshot = controller.read_instrument_snapshot()
+        self.assertIsNone(snapshot.nplc)
+        self.assertEqual(snapshot.digits, 6)
+        self.assertTrue(
+            any(command.endswith("NPLCycles?") for command, _error in snapshot.query_errors)
+        )
+        self.assertFalse(any(kind == "write" for kind, _command, _tid in instrument.log))
+
+    def test_snapshot_timeout_marks_only_the_affected_field_unknown(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.query_overrides[":SENSE:CURRENT:DC:MEDIAN:RANK?"] = TimeoutError(
+            "timeout simulado"
+        )
+        snapshot = controller.read_instrument_snapshot()
+        self.assertIsNone(snapshot.median_rank)
+        self.assertEqual(snapshot.nplc, 1.0)
+        self.assertTrue(
+            any(command.endswith("MEDian:RANK?") for command, _error in snapshot.query_errors)
+        )
+
+    def test_apply_advanced_delta_writes_only_changed_field_then_confirms(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        instrument.log.clear()
+        confirmed = controller.apply_advanced_changes({"nplc": 2.0})
+        writes = [command for kind, command, _tid in instrument.log if kind == "write"]
+        self.assertEqual(writes, [":SENSe:CURRent:DC:NPLCycles 2"])
+        self.assertEqual(confirmed.nplc, 2.0)
+        operations = [(kind, command) for kind, command, _tid in instrument.log]
+        write_index = operations.index(("write", ":SENSe:CURRent:DC:NPLCycles 2"))
+        confirm_index = max(
+            index
+            for index, item in enumerate(operations)
+            if item == ("query", ":SENSe:CURRent:DC:NPLCycles?")
+        )
+        self.assertLess(write_index, confirm_index)
+
+    def test_zero_correct_uses_front_panel_sequence_and_keeps_zero_check_on(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        instrument.log.clear()
+
+        confirmed = controller.acquire_zero_correct()
+
+        writes = [command for kind, command, _tid in instrument.log if kind == "write"]
+        self.assertEqual(
+            writes,
+            [
+                ":SYSTem:ZCORrect:STATe OFF",
+                ":SYSTem:ZCORrect:STATe ON",
+            ],
+        )
+        self.assertTrue(confirmed.zero_check)
+        self.assertTrue(confirmed.zero_correct)
+        self.assertNotIn(":SYSTem:ZCORrect:ACQuire", writes)
+
+    def test_enable_rel_delta_rewrites_cached_value_before_state_on(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        instrument.rel_value = 0.125
+        instrument.log.clear()
+
+        confirmed = controller.apply_advanced_changes({"rel_enabled": True})
+
+        reference_writes = [
+            command
+            for kind, command, _tid in instrument.log
+            if kind == "write" and ":REFerence" in command
+        ]
+        self.assertEqual(
+            reference_writes,
+            [
+                ":SENSe:CURRent:DC:REFerence 1.250000000000E-01",
+                ":SENSe:CURRent:DC:REFerence:STATe ON",
+            ],
+        )
+        self.assertTrue(confirmed.rel_enabled)
+        self.assertEqual(confirmed.rel_value, 0.125)
+
+    def test_acquire_rel_takes_valid_reading_and_programs_it_explicitly(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        instrument.zero_check = False
+        controller.read_instrument_snapshot()
+        instrument.log.clear()
+
+        confirmed = controller.acquire_rel()
+
+        writes = [command for kind, command, _tid in instrument.log if kind == "write"]
+        queries = [command for kind, command, _tid in instrument.log if kind == "query"]
+        self.assertIn(":READ?", queries)
+        self.assertNotIn(":SENSe:CURRent:DC:REFerence:ACQuire", writes)
+        reference_writes = [command for command in writes if ":REFerence" in command]
+        self.assertEqual(
+            reference_writes,
+            [
+                ":SENSe:CURRent:DC:REFerence:STATe OFF",
+                ":SENSe:CURRent:DC:REFerence 3.000000000000E-12",
+                ":SENSe:CURRent:DC:REFerence:STATe ON",
+            ],
+        )
+        self.assertTrue(confirmed.rel_enabled)
+        self.assertAlmostEqual(confirmed.rel_value or 0.0, 3.0e-12)
+
+    def test_reconnect_adopts_current_panel_state_without_cache_writeback(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        controller.disconnect()
+        instrument.front_panel_set(nplc=10.0, aperture=10.0 / 60.0)
+        instrument.log.clear()
+        controller.connect("GPIB0::27::INSTR")
+        snapshot = controller.read_instrument_snapshot()
+        self.assertEqual(snapshot.nplc, 10.0)
+        self.assertFalse(any(kind == "write" for kind, _command, _tid in instrument.log))
 
     def test_every_explicit_abort_is_preceded_by_continuous_off(self) -> None:
         controller, instrument, _manager = self.make_controller()
@@ -333,6 +696,64 @@ class ControllerFixture(unittest.TestCase):
         self.assertEqual(first.status, ReadingStatus.OK)
         self.assertEqual(second.status, ReadingStatus.OK)
 
+    def test_live_restores_manual_trigger_setup_after_abort(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        instrument.front_panel_set(
+            arm_count=4,
+            arm_source="BUS",
+            arm2_count=3,
+            arm2_source="TLIN",
+            trigger_source="TIM",
+            trigger_count=11,
+            trigger_timer=0.25,
+            trigger_delay=0.005,
+        )
+
+        controller.start_live()
+        self.assertEqual(instrument.trigger_count, 1)
+        self.assertEqual(instrument.trigger_delay, 0.0)
+        controller.abort()
+
+        self.assertEqual(instrument.arm_count, 4)
+        self.assertEqual(instrument.arm_source, "BUS")
+        self.assertEqual(instrument.arm2_count, 3)
+        self.assertEqual(instrument.arm2_source, "TLIN")
+        self.assertEqual(instrument.trigger_source, "TIM")
+        self.assertEqual(instrument.trigger_count, 11)
+        self.assertEqual(instrument.trigger_timer, 0.25)
+        self.assertEqual(instrument.trigger_delay, 0.005)
+
+    def test_live_discards_stale_error_before_start(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        instrument.error_queue.append('-410,"Query INTERRUPTED"')
+        instrument.log.clear()
+
+        controller.start_live()
+
+        self.assertEqual(controller.state, ControllerState.ACQUIRING)
+        operations = [(kind, command) for kind, command, _tid in instrument.log]
+        first_write = next(
+            index for index, item in enumerate(operations) if item[0] == "write"
+        )
+        stale_error_read = operations.index(("query", ":SYSTem:ERRor?"))
+        self.assertLess(stale_error_read, first_write)
+        controller.abort()
+
+    def test_successful_abort_recovers_error_state_to_configuration(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        controller.state_machine.force_error("erro simulado de aquisição")
+
+        controller.abort()
+
+        self.assertEqual(controller.state, ControllerState.CONFIGURED)
+        self.assertFalse(instrument.error_queue)
+
     def test_one_shot_has_idle_sequence_then_read(self) -> None:
         controller, instrument, _manager = self.make_controller()
         controller.connect("GPIB0::27::INSTR")
@@ -348,6 +769,45 @@ class ControllerFixture(unittest.TestCase):
         self.assertEqual(reading.value, 3.0e-12)
         self.assertEqual(controller.state, ControllerState.CONFIGURED)
 
+    def test_one_shot_restores_continuous_front_panel_display(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        self.configure_voltage(controller)
+        instrument.continuous_initiation = True
+
+        controller.one_shot_read()
+
+        self.assertTrue(instrument.continuous_initiation)
+        writes = [command for kind, command, _tid in instrument.log if kind == "write"]
+        self.assertEqual(writes[-1], ":INITiate:CONTinuous ON")
+
+    def test_live_abort_restores_continuous_front_panel_display(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        self.configure_voltage(controller)
+        instrument.continuous_initiation = True
+
+        controller.start_live()
+        controller.abort()
+
+        self.assertTrue(instrument.continuous_initiation)
+        writes = [command for kind, command, _tid in instrument.log if kind == "write"]
+        self.assertEqual(writes[-1], ":INITiate:CONTinuous ON")
+
+    def test_live_abort_resumes_display_after_reset_left_continuous_off(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        self.configure_voltage(controller)
+        # *RST/safe idle leaves the front-panel display stopped.
+        instrument.continuous_initiation = False
+
+        controller.start_live()
+        controller.abort()
+
+        self.assertTrue(instrument.continuous_initiation)
+        writes = [command for kind, command, _tid in instrument.log if kind == "write"]
+        self.assertEqual(writes[-1], ":INITiate:CONTinuous ON")
+
     def test_buffer_poll_and_parse_statuses(self) -> None:
         controller, _instrument, _manager = self.make_controller()
         controller.connect("GPIB0::27::INSTR")
@@ -361,6 +821,35 @@ class ControllerFixture(unittest.TestCase):
             [ReadingStatus.OK, ReadingStatus.OVERLOAD],
         )
         self.assertEqual(controller.state, ControllerState.CONFIGURED)
+
+    def test_buffer_restores_manual_trigger_setup_after_transfer(self) -> None:
+        controller, instrument, _manager = self.make_controller()
+        controller.connect("GPIB0::27::INSTR")
+        controller.read_instrument_snapshot()
+        instrument.front_panel_set(
+            arm_count=5,
+            arm_source="BUS",
+            arm2_count=2,
+            arm2_source="EXT",
+            trigger_source="IMM",
+            trigger_count=11,
+            trigger_timer=0.5,
+            trigger_delay=0.005,
+        )
+
+        controller.prepare_buffer(2, source="TIMer", timer_interval=0.01)
+        controller.start_buffer()
+        controller.wait_buffer_complete(1.0)
+        controller.read_buffer_readings()
+
+        self.assertEqual(instrument.arm_count, 5)
+        self.assertEqual(instrument.arm_source, "BUS")
+        self.assertEqual(instrument.arm2_count, 2)
+        self.assertEqual(instrument.arm2_source, "EXT")
+        self.assertEqual(instrument.trigger_source, "IMM")
+        self.assertEqual(instrument.trigger_count, 11)
+        self.assertEqual(instrument.trigger_timer, 0.5)
+        self.assertEqual(instrument.trigger_delay, 0.005)
 
     def test_buffer_timeout_enters_error_and_can_recover_safe(self) -> None:
         controller, instrument, _manager = self.make_controller()
@@ -633,7 +1122,7 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(readings[0].raw_timestamp, "0")
         self.assertEqual(readings[0].status, ReadingStatus.OK)
 
-    def test_csv_contains_status(self) -> None:
+    def test_csv_contains_only_display_columns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "reading.csv"
             with CsvAcquisitionWriter(path) as writer:
@@ -649,8 +1138,40 @@ class ParsingTests(unittest.TestCase):
                     "A01",
                 )
             contents = path.read_text(encoding="utf-8")
-            self.assertIn("OVERLOAD", contents)
-            self.assertIn("+9.910000E+37", contents)
+            self.assertEqual(
+                contents.splitlines()[0],
+                "#,Tempo (s),Valor,Un.",
+            )
+            self.assertEqual(contents.splitlines()[1], "1,1.25,9.91e+37,A")
+
+    def test_xlsx_export_contains_only_display_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "reading.csv"
+            xlsx_path = Path(directory) / "reading.xlsx"
+            with CsvAcquisitionWriter(csv_path) as writer:
+                writer.write(
+                    1,
+                    1.25,
+                    2.5,
+                    "+2.500000E+00",
+                    "V",
+                    "OK",
+                    "6517A",
+                    "1234",
+                    "A01",
+                )
+            export_csv_to_xlsx(csv_path, xlsx_path)
+            with zipfile.ZipFile(xlsx_path) as archive:
+                sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            self.assertIn("Tempo (s)", sheet)
+            self.assertIn("Valor", sheet)
+            self.assertIn("Un.", sheet)
+            self.assertNotIn("media", sheet)
+            self.assertNotIn("desvpad", sheet)
+            self.assertNotIn("erro%", sheet)
+            self.assertNotIn("<f>", sheet)
+            self.assertNotIn("raw_value", sheet)
+            self.assertNotIn("status", sheet)
 
 
 if __name__ == "__main__":

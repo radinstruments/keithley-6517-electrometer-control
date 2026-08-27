@@ -31,9 +31,9 @@ O Keithley 6517 Electrometer Control é uma interface desktop em Python para ope
 | --- | --- |
 | Comunicação | Descoberta de recursos VISA/GPIB, conexão serializada e identificação por `*IDN?` |
 | Instrumentos | Perfis específicos para Keithley 6517A e 6517B, com validação de capacidades |
-| Medição | Configuração de função, faixa, NPLC, dígitos, trigger, formato e buffer |
+| Medição | Controle de função e NPLC, com monitoramento das correções, trigger e parâmetros matemáticos configurados no painel |
 | Aquisição | Leitura one-shot, modo LIVE por `:SENSe:DATA:FRESh?` e aquisição por buffer |
-| Dados | CSV com leitura, timestamp, status e classificação de condições de medição |
+| Dados | CSV e XLSX com as colunas `#`, `Tempo (s)`, `Valor` e `Un.` |
 | Interface | CustomTkinter, navegação lateral, tema claro/escuro e layout responsivo |
 | Alta tensão | Standby obrigatório, limite ativo, interlock, checklist e desligamento prioritário |
 | Operação | Gráfico em tempo real, logs, cancelamento de aquisição e recuperação de falhas |
@@ -79,13 +79,17 @@ Para abrir a interface completa:
 python -m src.main
 ```
 
+O executável e o instalador são gerados em `dist/`. O instalador permite escolher
+se será criado um atalho na Área de Trabalho. Os arquivos de uso ficam em
+`Documentos\Keithley6517ControlStudio\data`, `log` e `config`.
+
 Para testar somente a comunicação e a identificação do instrumento:
 
 ```powershell
 python src/keithley_6517_comunicacao.py
 ```
 
-O recurso VISA pode ser informado no formato `GPIB0::27::INSTR`. A aplicação também oferece a descoberta dos recursos disponíveis e seleciona o perfil correspondente à resposta de `*IDN?`.
+O recurso VISA pode ser informado no formato `GPIB0::27::INSTR`. Quando existe exatamente um recurso disponível, a aplicação conecta automaticamente em modo observador: consulta os parâmetros atuais do painel e os apresenta sem reescrevê-los. Depois da leitura, envia GPIB Go To Local para liberar imediatamente as teclas físicas. Na página **Medição**, o programa atualiza o monitor automaticamente a cada 2,5 s e libera o painel sem exigir botões auxiliares. A aplicação permite alterar somente **Função** e **NPLC**, mediante **Aplicar parâmetros** e confirmação por leitura. O autorange, Zero Check, Zero Correct, REL e os parâmetros matemáticos continuam sendo configurados diretamente no painel do eletrometro; a aquisição lê e preserva essas configurações.
 
 ## Aquisição de dados
 
@@ -93,12 +97,13 @@ O fluxo recomendado é:
 
 1. Descobrir os recursos VISA e confirmar o endereço GPIB.
 2. Conectar e validar o modelo retornado pelo instrumento.
-3. Selecionar a função, faixa, NPLC, resolução e formato da medição.
+3. Configurar no app Função e NPLC; configurar manualmente no painel do eletrometro o autorange, as correções, trigger e filtros matemáticos; conferir os valores no monitor da página Medição.
 4. Executar uma leitura de teste antes de iniciar uma sequência.
-5. Escolher aquisição LIVE ou por buffer e iniciar a coleta.
-6. Encerrar a aquisição antes de desconectar o instrumento.
+5. Se for usar a fonte interna, ative-a somente depois da configuração; a aquisição pode ocorrer com HV ativa e não reconfigura nem desliga a fonte.
+6. Escolher aquisição LIVE ou por buffer e iniciar a coleta.
+7. Desligar a HV pelo comando de standby antes de tocar no circuito ou desconectar o instrumento.
 
-As leituras são classificadas para que condições como `OK`, `OVERLOAD`, `UNDERFLOW`, `COMPLIANCE`, `INVALID` e `ERROR` não sejam confundidas com valores numéricos válidos. Os arquivos CSV ficam em `data/` e os logs em `var/logs/`.
+As leituras são classificadas internamente para o gráfico e os logs. Ao final de cada aquisição, os arquivos CSV e XLSX com as quatro colunas exibidas na tabela são salvos automaticamente em `data/`; os logs ficam em `log/` e as preferências em `config/`. No executável, essas três pastas ficam em `Documentos\Keithley6517ControlStudio\`.
 
 ## Segurança
 
@@ -121,6 +126,8 @@ python -m unittest discover -s tests -v
 
 Os testes usam instrumentos VISA simulados para verificar a ordem dos comandos SCPI, os perfis A/B, o formato do buffer, a máquina de estados, as proteções de alta tensão e as fronteiras da interface. A execução dos testes não deve enviar comandos ao instrumento físico.
 
+Leituras que o 6517 marca como inválidas (por exemplo, o sentinela `9.91E+37` com Zero Check ligado) são preservadas no CSV com seu status, mas não são desenhadas como medições válidas no gráfico.
+
 ## Estrutura do repositório
 
 ```text
@@ -134,8 +141,9 @@ src/
   keithley_6517_storage.py        CSV, logs e caminhos do projeto
 tests/                            testes automatizados sem hardware
 data/                             aquisições exportadas
+log/                              logs da aplicação e protocolo VISA
+config/                           preferências da aplicação
 docs/                             comunicação, SCPI e operação
-var/                              logs e arquivos temporários locais
 ```
 
 ## Licença

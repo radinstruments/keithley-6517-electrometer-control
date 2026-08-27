@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="256"
+     height="256"
+     viewBox="0 0 256 256"
+     role="img"
+     aria-labelledby="title desc">
+  <title id="title">Ícone RADinstruments</title>
+  <desc id="desc">Trifólio ciano da RADinstruments centralizado em um quadrado arredondado azul-marinho sólido.</desc>
+
+  <defs>
+    <clipPath id="markCrop" clipPathUnits="userSpaceOnUse">
+      <rect x="76" y="76" width="104" height="104"/>
+    </clipPath>
+  </defs>
+
+  <!-- Um único retângulo sólido, como no exemplo de ícone enviado. -->
+  <rect width="256" height="256" rx="52" fill="#061A3A"/>
+
+  <!-- Recorte centralizado do trifólio existente em assets/branding/radinstruments_250x37.png. -->
+  <image x="76" y="76" width="697.081" height="104" preserveAspectRatio="none" clip-path="url(#markCrop)" href="radinstruments_250x37.png" xlink:href="radinstruments_250x37.png"/>
+</svg>

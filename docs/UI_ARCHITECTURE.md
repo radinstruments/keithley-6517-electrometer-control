@@ -42,6 +42,8 @@ O menu é a navegação primária e permanente:
 - Configurações ancorada no rodapé e demais páginas no agrupamento principal;
 - páginas Painel, Conexão, Medição, Aquisição, Alta tensão, Console SCPI, Registros e Configurações.
 
+A página Medição combina dois controles explícitos — Função e NPLC — com monitoramento somente leitura das demais configurações. Autorange, Zero Check, Zero Correct, REL e os parâmetros matemáticos devem ser operados manualmente no painel físico; a aplicação consulta o instrumento periodicamente e só envia os deltas desses dois controles após **Aplicar parâmetros**, sempre confirmando por uma nova leitura. A conexão automática é observadora, atualiza o monitor e libera o painel físico com GPIB Go To Local sem exigir botões auxiliares. A aquisição faz uma leitura final antes de iniciar sem substituir os parâmetros manuais.
+
 O menu ocupa o lado esquerdo da janela; todo conteúdo operacional fica à direita. Os glifos são SVGs selecionados do conjunto oficial Microsoft VS Code Codicons e redistribuídos sob CC BY 4.0. Os SVGs-fonte, a atribuição e as versões PNG de alta densidade usadas pelo CustomTkinter ficam em `assets/icons/codicons/`. Nenhuma marca ou logotipo da Microsoft é usado como identidade do aplicativo.
 
 ## Desempenho

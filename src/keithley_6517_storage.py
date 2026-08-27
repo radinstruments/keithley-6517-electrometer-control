@@ -9,10 +9,13 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO
+from xml.etree import ElementTree
 
 
 @dataclass(frozen=True)
@@ -28,8 +31,8 @@ class ProjectPaths:
         return cls(
             root=resolved,
             data=resolved / "data",
-            logs=resolved / "var" / "logs",
-            preferences=resolved / "var" / "preferences.json",
+            logs=resolved / "log",
+            preferences=resolved / "config" / "preferences.json",
         )
 
     def ensure_runtime_directories(self) -> None:
@@ -58,7 +61,7 @@ def configure_logging(paths: ProjectPaths, level: int = logging.INFO) -> Path:
             )
         )
         root_logger.addHandler(handler)
-    protocol_dir = paths.root / "log"
+    protocol_dir = paths.logs
     protocol_dir.mkdir(parents=True, exist_ok=True)
     protocol_logger = logging.getLogger("keithley.protocol")
     protocol_logger.setLevel(logging.INFO)
@@ -140,16 +143,10 @@ def next_available_acquisition_path(path: Path) -> Path:
 
 class CsvAcquisitionWriter:
     HEADER = (
-        "sample",
-        "host_time_iso",
-        "instrument_time_s",
-        "value",
-        "raw_value",
-        "unit",
-        "status",
-        "model",
-        "serial",
-        "firmware",
+        "#",
+        "Tempo (s)",
+        "Valor",
+        "Un.",
     )
 
     def __init__(self, path: Path) -> None:
@@ -184,15 +181,9 @@ class CsvAcquisitionWriter:
         self._writer.writerow(
             (
                 sample,
-                datetime.now().astimezone().isoformat(),
                 "{0:.9g}".format(instrument_time_s),
                 "{0:.12g}".format(value),
-                raw_value,
                 unit,
-                status,
-                model,
-                serial,
-                firmware,
             )
         )
         self._handle.flush()
@@ -202,6 +193,112 @@ class CsvAcquisitionWriter:
             self._handle.close()
         self._handle = None
         self._writer = None
+
+
+_XLSX_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _xlsx_column_name(index: int) -> str:
+    name = ""
+    value = index
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def _xlsx_cell(row: int, column: int, value: Any) -> ElementTree.Element:
+    cell = ElementTree.Element(
+        "{{{0}}}c".format(_XLSX_NS),
+        {"r": "{0}{1}".format(_xlsx_column_name(column), row)},
+    )
+    number: Optional[float] = None
+    if column in (1, 2, 3):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = None
+        if number is not None and not math.isfinite(number):
+            number = None
+    if number is not None:
+        cell.set("t", "n")
+        ElementTree.SubElement(cell, "{{{0}}}v".format(_XLSX_NS)).text = (
+            str(int(number)) if number.is_integer() else "{0:.15g}".format(number)
+        )
+    else:
+        cell.set("t", "inlineStr")
+        inline = ElementTree.SubElement(cell, "{{{0}}}is".format(_XLSX_NS))
+        ElementTree.SubElement(inline, "{{{0}}}t".format(_XLSX_NS)).text = str(value or "")
+    return cell
+
+
+def export_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
+    """Convert the four-column acquisition CSV into a simple XLSX workbook."""
+
+    source = Path(csv_path)
+    destination = Path(xlsx_path)
+    with source.open("r", newline="", encoding="utf-8") as handle:
+        rows: List[List[str]] = list(csv.reader(handle))
+    if not rows:
+        raise ValueError("O arquivo CSV da aquisição está vazio.")
+
+    ElementTree.register_namespace("", _XLSX_NS)
+    ElementTree.register_namespace("r", _REL_NS)
+    worksheet = ElementTree.Element("{{{0}}}worksheet".format(_XLSX_NS))
+    sheet_data = ElementTree.SubElement(
+        worksheet, "{{{0}}}sheetData".format(_XLSX_NS)
+    )
+    for row_number, values in enumerate(rows, start=1):
+        row = ElementTree.SubElement(
+            sheet_data,
+            "{{{0}}}row".format(_XLSX_NS),
+            {"r": str(row_number)},
+        )
+        for column_number, value in enumerate(values, start=1):
+            row.append(_xlsx_cell(row_number, column_number, value))
+
+    workbook = ElementTree.Element("{{{0}}}workbook".format(_XLSX_NS))
+    sheets = ElementTree.SubElement(workbook, "{{{0}}}sheets".format(_XLSX_NS))
+    ElementTree.SubElement(
+        sheets,
+        "{{{0}}}sheet".format(_XLSX_NS),
+        {
+            "name": "Medições",
+            "sheetId": "1",
+            "{{{0}}}id".format(_REL_NS): "rId1",
+        },
+    )
+
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"""
+    package_relationships = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+    workbook_relationships = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", package_relationships)
+        archive.writestr(
+            "xl/workbook.xml",
+            ElementTree.tostring(workbook, encoding="utf-8", xml_declaration=True),
+        )
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_relationships)
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            ElementTree.tostring(worksheet, encoding="utf-8", xml_declaration=True),
+        )
 
 
 def load_preferences(paths: ProjectPaths) -> Dict[str, Any]:
@@ -225,6 +322,7 @@ def save_preferences(paths: ProjectPaths, preferences: Dict[str, Any]) -> None:
 
 __all__ = [
     "CsvAcquisitionWriter",
+    "export_csv_to_xlsx",
     "ProjectPaths",
     "configure_logging",
     "acquisition_day_folder",

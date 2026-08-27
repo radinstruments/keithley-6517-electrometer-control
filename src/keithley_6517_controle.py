@@ -223,9 +223,13 @@ class KeithleyControlApp:
             btns, text="Desconectar", command=lambda: self.disconnect_prompt(), state="disabled"
         )
         self.disconnect_button.grid(row=0, column=1, padx=2)
-        ttk.Button(btns, text="*IDN?", command=self.query_idn).grid(row=0, column=2, padx=2)
+        self.release_front_panel_button = ttk.Button(
+            btns, text="Liberar painel", command=self.release_front_panel, state="disabled"
+        )
+        self.release_front_panel_button.grid(row=0, column=2, padx=2)
+        ttk.Button(btns, text="*IDN?", command=self.query_idn).grid(row=0, column=3, padx=2)
         ttk.Button(btns, text="*OPT? (options)", command=self.query_options).grid(
-            row=0, column=3, padx=2
+            row=0, column=4, padx=2
         )
 
         safe = ttk.LabelFrame(tab, text="Comandos seguros", padding=10)
@@ -912,9 +916,42 @@ class KeithleyControlApp:
             if connected and not self._hv_operation_running
             else "disabled"
         )
+        self.release_front_panel_button.configure(
+            state=(
+                "normal"
+                if connected
+                and not self._hv_operation_running
+                and not self.acq_running
+                and not self._scpi_running
+                else "disabled"
+            )
+        )
 
     def _append_hv_log(self, text: str) -> None:
         self._append_log(self.hv_log, text)
+
+    def release_front_panel(self) -> None:
+        """Return the connected GPIB instrument to local panel control."""
+
+        if not self._require_connected():
+            return
+        if self.acq_running or self._hv_operation_running or self._scpi_running:
+            messagebox.showwarning(
+                "Painel",
+                "Aguarde a operação em andamento terminar antes de liberar o painel.",
+            )
+            return
+        try:
+            if not self.controller.release_front_panel():
+                raise RuntimeError(
+                    "O driver VISA não conseguiu enviar GPIB Go To Local."
+                )
+            self.status_var.set("Painel frontal liberado para operação manual.")
+            self._append_connection_log(
+                f"[{datetime.now():%H:%M:%S}] Painel frontal liberado por GPIB GTL.\n"
+            )
+        except Exception as error:
+            self._show_error("Não foi possível liberar o painel", error)
 
     def _on_function_change(self, _evt: tk.Event) -> None:
         raw = self.acq_function_var.get()
