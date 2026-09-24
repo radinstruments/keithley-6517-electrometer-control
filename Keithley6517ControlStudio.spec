@@ -11,7 +11,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['packaging\\entrypoint.py'],
+    ['packaging/entrypoint.py'],
     pathex=['.'],
     binaries=binaries,
     datas=datas,
@@ -44,5 +44,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets\\branding\\keithley_6517_spectrum_icon.ico'],
+    icon=['assets/branding/keithley_6517_spectrum_icon.ico'],
+    version='packaging/version_info.txt',
 )

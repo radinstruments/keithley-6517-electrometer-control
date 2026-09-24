@@ -13,9 +13,9 @@ import tkinter as tk
 import ctypes
 import webbrowser
 from ctypes import wintypes
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 import customtkinter as ctk
@@ -23,10 +23,24 @@ from PIL import Image
 
 try:
     from .keithley_6517_contracts import AppIntent, IntentKind, PageId, ViewState
+    from .keithley_6517_file_browser import (
+        AcquisitionFile,
+        AcquisitionPoint,
+        list_acquisition_files,
+        read_acquisition_file,
+    )
     from .runtime_paths import resource_root
+    from .version import __version__
 except ImportError:  # pragma: no cover - direct src execution compatibility
     from keithley_6517_contracts import AppIntent, IntentKind, PageId, ViewState
+    from keithley_6517_file_browser import (
+        AcquisitionFile,
+        AcquisitionPoint,
+        list_acquisition_files,
+        read_acquisition_file,
+    )
     from runtime_paths import resource_root
+    from version import __version__
 
 
 COLORS = {
@@ -55,6 +69,7 @@ PAGE_TITLES = {
     PageId.CONNECTION: "Conexão",
     PageId.MEASUREMENT: "Medição",
     PageId.ACQUISITION: "Aquisição",
+    PageId.FILES: "Arquivos",
     PageId.HIGH_VOLTAGE: "Alta tensão",
     PageId.SCPI: "Console SCPI",
     PageId.LOGS: "Registros",
@@ -67,6 +82,7 @@ NAV_ITEMS = (
     (PageId.CONNECTION, "usb-symbol", "Conexão"),
     (PageId.MEASUREMENT, "pulse", "Medição"),
     (PageId.ACQUISITION, "graph-line", "Aquisição"),
+    (PageId.FILES, "folder", "Arquivos"),
     (PageId.HIGH_VOLTAGE, "symbol-event", "Alta tensão"),
     (PageId.SCPI, "terminal-compact", "Console SCPI"),
     (PageId.LOGS, "history", "Registros"),
@@ -159,7 +175,12 @@ def _automatic_filename_parts(state: ViewState, mode: str) -> Tuple[str, ...]:
     """Return the mode and function used in an automatic filename."""
 
     snapshot = state.instrument_snapshot
-    function_path = snapshot.function or state.measurement_function
+    draft_values = dict(state.draft_values)
+    function_path = (
+        draft_values.get("function")
+        or snapshot.function
+        or state.measurement_function
+    )
     function_part = next(
         (
             FUNCTION_FILENAME_PARTS[name]
@@ -245,6 +266,7 @@ class Keithley6517UI(ctk.CTk):
 
     POLL_MS = 50
     MONITOR_MS = 2500
+    FILE_SCAN_MS = 5000
 
     @staticmethod
     def _work_area() -> Tuple[int, int, int, int]:
@@ -297,12 +319,24 @@ class Keithley6517UI(ctk.CTk):
         self._preview_after_id: Optional[str] = None
         self._poll_after_id: Optional[str] = None
         self._monitor_after_id: Optional[str] = None
+        self._file_browser_after_id: Optional[str] = None
+        self._browser_table_after_id: Optional[str] = None
+        self._browser_filter_after_id: Optional[str] = None
         self._last_table_index = 0
+        self._suppress_existing_readings = False
         self._last_log_revision = -1
         self._last_output: Tuple[str, ...] = ()
         self._chart_points: List[Tuple[float, float, float, float, int]] = []
         self._chart_hover_index: Optional[int] = None
         self._automatic_filename_signature: Optional[Tuple[str, ...]] = None
+        self._browser_files: Dict[str, AcquisitionFile] = {}
+        self._browser_selected_path: Optional[Path] = None
+        self._browser_selected_signature: Optional[Tuple[Path, datetime, int]] = None
+        self._browser_points: Tuple[AcquisitionPoint, ...] = ()
+        self._browser_unit = ""
+        self._browser_listing_signature: Optional[Tuple[Tuple[Path, datetime, int], ...]] = None
+        self._browser_query_signature: Optional[Tuple[Path, Optional[date], str]] = None
+        self._browser_generation = 0
 
         self._build_sidebar()
         self._build_header()
@@ -313,6 +347,7 @@ class Keithley6517UI(ctk.CTk):
         self._render(initial_state)
         self._poll_after_id = self.after(self.POLL_MS, self._poll_application)
         self._monitor_after_id = self.after(self.MONITOR_MS, self._poll_monitor)
+        self._file_browser_after_id = self.after(self.FILE_SCAN_MS, self._poll_file_browser)
 
     @staticmethod
     def _set_windows_app_id() -> None:
@@ -525,13 +560,19 @@ class Keithley6517UI(ctk.CTk):
         ).grid(row=1, column=0, padx=28)
         ctk.CTkLabel(
             card,
+            text="Versão {0}".format(__version__),
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, padx=28, pady=(2, 0))
+        ctk.CTkLabel(
+            card,
             text="Interface de controle para os eletrômetros Keithley 6517A e 6517B",
             width=360,
             wraplength=360,
             justify="center",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=12),
-        ).grid(row=2, column=0, padx=28, pady=(6, 20))
+        ).grid(row=3, column=0, padx=28, pady=(6, 20))
 
         site_button = ctk.CTkButton(
             card,
@@ -544,7 +585,7 @@ class Keithley6517UI(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._open_rad_website,
         )
-        site_button.grid(row=3, column=0, padx=28, pady=(0, 18))
+        site_button.grid(row=4, column=0, padx=28, pady=(0, 18))
         self._tooltips.append(_Tooltip(site_button, RAD_WEBSITE))
 
         ctk.CTkLabel(
@@ -552,7 +593,7 @@ class Keithley6517UI(ctk.CTk):
             text="© 2026 RADinstruments Ltda.",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=11),
-        ).grid(row=4, column=0, padx=28, pady=(0, 8))
+        ).grid(row=5, column=0, padx=28, pady=(0, 8))
         ctk.CTkButton(
             card,
             text="Fechar",
@@ -564,7 +605,7 @@ class Keithley6517UI(ctk.CTk):
             text_color=COLORS["text"],
             hover_color=COLORS["hover"],
             command=self._close_about,
-        ).grid(row=5, column=0, padx=28, pady=(0, 24))
+        ).grid(row=6, column=0, padx=28, pady=(0, 24))
 
         dialog.update_idletasks()
         width = dialog.winfo_reqwidth()
@@ -699,6 +740,7 @@ class Keithley6517UI(ctk.CTk):
         self._build_connection_page()
         self._build_measurement_page()
         self._build_acquisition_page()
+        self._build_file_browser_page()
         self._build_hv_page()
         self._build_scpi_page()
         self._build_logs_page()
@@ -1134,12 +1176,21 @@ class Keithley6517UI(ctk.CTk):
         self.file_entry.grid(row=3, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
         self.file_entry.bind("<KeyRelease>", self._acquisition_filename_edited, add="+")
         self._set_default_acquisition_filename("LIVE")
+        folder_actions = ctk.CTkFrame(controls, fg_color="transparent")
+        folder_actions.grid(row=3, column=3, sticky="e", padx=16, pady=(0, 12))
+        self.refresh_filename_button = ctk.CTkButton(
+            folder_actions,
+            text="Atualizar nome",
+            width=118,
+            command=self._refresh_acquisition_filename,
+        )
+        self.refresh_filename_button.grid(row=0, column=0, padx=(0, 6))
         ctk.CTkButton(
-            controls,
+            folder_actions,
             text="Abrir pasta",
-            width=110,
+            width=100,
             command=self._open_data_folder,
-        ).grid(row=3, column=3, sticky="e", padx=16, pady=(0, 12))
+        ).grid(row=0, column=1)
         actions = ctk.CTkFrame(controls, fg_color="transparent")
         actions.grid(row=4, column=0, columnspan=4, sticky="ew", padx=16, pady=(4, 16))
         self.start_acquisition_button = ctk.CTkButton(actions, text="Iniciar aquisição", command=self._start_acquisition)
@@ -1180,6 +1231,133 @@ class Keithley6517UI(ctk.CTk):
             self.reading_tree.heading(key, text=title)
             self.reading_tree.column(key, width=width, anchor="e" if key in ("time", "value") else "center")
         self.reading_tree.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
+
+    def _build_file_browser_page(self) -> None:
+        page = self._page(PageId.FILES)
+        self._section_header(
+            page,
+            "Arquivos de aquisição",
+            "Navegue pelas pastas, filtre por data e formato e selecione um arquivo para visualizar as medições.",
+        )
+
+        filters = self._card(page, 1)
+        filters.grid_columnconfigure(0, weight=1)
+        self._label(filters, "Pasta pesquisada", 0, 0, text_color=COLORS["muted"])
+        self.browser_root_entry = ctk.CTkEntry(filters)
+        self.browser_root_entry.insert(0, str(Path(self.coordinator.paths.data).resolve()))
+        self.browser_root_entry.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.browser_root_entry.bind("<Return>", lambda _event: self._refresh_file_browser(), add="+")
+        ctk.CTkButton(
+            filters, text="Escolher pasta", width=120, command=self._choose_browser_folder
+        ).grid(row=1, column=1, padx=(0, 8), pady=(0, 10))
+        ctk.CTkButton(
+            filters, text="Atualizar lista", width=120, command=self._refresh_file_browser
+        ).grid(row=1, column=2, padx=(0, 16), pady=(0, 10))
+
+        date_controls = ctk.CTkFrame(filters, fg_color="transparent")
+        date_controls.grid(row=2, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 12))
+        self._label(date_controls, "Data (AAAA-MM-DD)", 0, 0, text_color=COLORS["muted"])
+        self.browser_date_entry = ctk.CTkEntry(date_controls, width=170, placeholder_text="Todas as datas")
+        self.browser_date_entry.grid(row=1, column=0, padx=(0, 18))
+        self.browser_date_entry.bind("<KeyRelease>", self._browser_filter_changed, add="+")
+        self._label(date_controls, "Formato", 0, 1, text_color=COLORS["muted"])
+        self.browser_kind_option = ctk.CTkOptionMenu(
+            date_controls,
+            values=["Todos", "CSV", "XLSX"],
+            width=130,
+            command=lambda _value: self._refresh_file_browser(),
+        )
+        self.browser_kind_option.set("Todos")
+        self.browser_kind_option.grid(row=1, column=1)
+        ctk.CTkButton(
+            date_controls,
+            text="Limpar data",
+            width=100,
+            fg_color="transparent",
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            command=self._clear_browser_date,
+        ).grid(row=1, column=2, padx=(12, 0))
+
+        listing = self._card(page, 2)
+        listing.grid_columnconfigure(0, weight=1)
+        self.browser_status = ctk.CTkLabel(
+            listing, text="Selecione uma pasta ou atualize a lista.", anchor="w", text_color=COLORS["muted"]
+        )
+        self.browser_status.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+        file_list = ctk.CTkFrame(listing, fg_color="transparent")
+        file_list.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
+        file_list.grid_columnconfigure(0, weight=1)
+        self.browser_file_tree = ttk.Treeview(
+            file_list,
+            columns=("name", "date", "type", "folder"),
+            show="headings",
+            height=9,
+            selectmode="browse",
+        )
+        for key, title, width, stretch in (
+            ("name", "Arquivo", 330, True),
+            ("date", "Data", 110, False),
+            ("type", "Tipo", 70, False),
+            ("folder", "Pasta", 280, True),
+        ):
+            self.browser_file_tree.heading(key, text=title)
+            self.browser_file_tree.column(key, width=width, stretch=stretch, anchor="w")
+        self.browser_file_tree.grid(row=0, column=0, sticky="nsew")
+        file_scrollbar = ttk.Scrollbar(file_list, orient="vertical", command=self.browser_file_tree.yview)
+        file_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.browser_file_tree.configure(yscrollcommand=file_scrollbar.set)
+        self.browser_file_tree.bind("<<TreeviewSelect>>", self._browser_file_selected, add="+")
+
+        preview = self._card(page, 3)
+        preview.grid_columnconfigure(0, weight=1)
+        self._label(preview, "Caminho completo do arquivo", 0, 0, text_color=COLORS["muted"])
+        self.browser_path_text = ctk.CTkTextbox(preview, height=42, wrap="none", state="disabled")
+        self.browser_path_text.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.browser_summary = ctk.CTkLabel(
+            preview, text="Selecione um arquivo para ver o gráfico e a tabela.", anchor="w", text_color=COLORS["muted"]
+        )
+        self.browser_summary.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+        browser_data = ctk.CTkFrame(preview, fg_color="transparent")
+        browser_data.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        browser_data.grid_columnconfigure(0, weight=1)
+        browser_data.grid_columnconfigure(1, weight=1)
+        self.browser_chart = tk.Canvas(browser_data, height=280, highlightthickness=0)
+        self.browser_chart.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.browser_chart.bind(
+            "<Configure>",
+            lambda _event: self._draw_chart(
+                self.current_state,
+                readings=self._browser_points,
+                canvas=self.browser_chart,
+                unit=self._browser_unit,
+            ),
+            add="+",
+        )
+        table_frame = ctk.CTkFrame(browser_data, fg_color="transparent")
+        table_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        self.browser_point_tree = ttk.Treeview(
+            table_frame,
+            columns=("sample", "time", "value", "unit"),
+            show="headings",
+            height=12,
+        )
+        for key, title, width in (
+            ("sample", "#", 55),
+            ("time", "Tempo (s)", 100),
+            ("value", "Valor", 145),
+            ("unit", "Un.", 55),
+        ):
+            self.browser_point_tree.heading(key, text=title)
+            self.browser_point_tree.column(key, width=width, anchor="e" if key in ("time", "value") else "center")
+        self.browser_point_tree.grid(row=0, column=0, sticky="nsew")
+        point_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.browser_point_tree.yview)
+        point_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.browser_point_tree.configure(yscrollcommand=point_scrollbar.set)
+        self._draw_chart(self.current_state, readings=(), canvas=self.browser_chart, unit="")
 
     def _build_hv_page(self) -> None:
         page = self._page(PageId.HIGH_VOLTAGE)
@@ -1357,6 +1535,8 @@ class Keithley6517UI(ctk.CTk):
             page_shell.grid()
             page_shell.tkraise()
             self._visible_page = page
+            if page == PageId.FILES:
+                self._refresh_file_browser()
         if dispatch:
             self._emit(IntentKind.NAVIGATE, page=page)
 
@@ -1374,6 +1554,9 @@ class Keithley6517UI(ctk.CTk):
         self._emit(IntentKind.DISCONNECT)
 
     def _configure_measurement(self) -> None:
+        self._set_default_acquisition_filename(
+            self.acquisition_mode.get(), force=True
+        )
         self._emit(IntentKind.APPLY_ADVANCED_CHANGES)
 
     def _reset_parameters(self) -> None:
@@ -1386,6 +1569,9 @@ class Keithley6517UI(ctk.CTk):
             parent=self,
         ):
             return
+        self._set_default_acquisition_filename(
+            self.acquisition_mode.get(), force=True
+        )
         self._emit(IntentKind.RESET_INSTRUMENT)
 
     def _advanced_edit(self, field: str, value: Any) -> None:
@@ -1501,7 +1687,7 @@ class Keithley6517UI(ctk.CTk):
         return "{0:.12g}".format(seconds)
 
     def _acquisition_mode_changed(self, mode: str) -> None:
-        self._set_default_acquisition_filename(mode)
+        self._set_default_acquisition_filename(mode, force=True)
 
     def _open_data_folder(self) -> None:
         """Open the application's default folder containing acquisition CSVs."""
@@ -1514,6 +1700,176 @@ class Keithley6517UI(ctk.CTk):
             import subprocess
 
             subprocess.Popen(["explorer", str(folder)])
+
+    def _choose_browser_folder(self) -> None:
+        folder = filedialog.askdirectory(
+            parent=self,
+            initialdir=self.browser_root_entry.get().strip() or str(Path.home()),
+            title="Escolher pasta com arquivos de aquisição",
+        )
+        if folder:
+            self.browser_root_entry.delete(0, "end")
+            self.browser_root_entry.insert(0, folder)
+            self._browser_listing_signature = None
+            self._browser_query_signature = None
+            self._refresh_file_browser()
+
+    def _clear_browser_date(self) -> None:
+        self.browser_date_entry.delete(0, "end")
+        self._refresh_file_browser()
+
+    def _browser_filter_changed(self, _event: Any = None) -> None:
+        if self._browser_filter_after_id is not None:
+            self.after_cancel(self._browser_filter_after_id)
+        self._browser_filter_after_id = self.after(300, self._refresh_file_browser)
+
+    def _poll_file_browser(self) -> None:
+        self._file_browser_after_id = None
+        if self._visible_page == PageId.FILES and not self.current_state.closing:
+            self._refresh_file_browser()
+        if not self.current_state.closing:
+            self._file_browser_after_id = self.after(self.FILE_SCAN_MS, self._poll_file_browser)
+
+    def _clear_browser_preview(self, path: Optional[Path] = None) -> None:
+        self._browser_generation += 1
+        if self._browser_table_after_id is not None:
+            self.after_cancel(self._browser_table_after_id)
+            self._browser_table_after_id = None
+        self._browser_points = ()
+        self._browser_unit = ""
+        for item in self.browser_point_tree.get_children():
+            self.browser_point_tree.delete(item)
+        self.browser_path_text.configure(state="normal")
+        self.browser_path_text.delete("1.0", "end")
+        if path is not None:
+            self.browser_path_text.insert("1.0", str(path))
+        self.browser_path_text.configure(state="disabled")
+        self._draw_chart(self.current_state, readings=(), canvas=self.browser_chart, unit="")
+
+    def _refresh_file_browser(self) -> None:
+        self._browser_filter_after_id = None
+        raw_date = self.browser_date_entry.get().strip()
+        try:
+            if raw_date and (len(raw_date) != 10 or raw_date[4] != "-" or raw_date[7] != "-"):
+                raise ValueError("Use a data no formato AAAA-MM-DD.")
+            selected_day = date.fromisoformat(raw_date) if raw_date else None
+            root = Path(self.browser_root_entry.get().strip()).expanduser()
+            files = list_acquisition_files(root, selected_day, self.browser_kind_option.get())
+        except (OSError, ValueError) as error:
+            self.browser_status.configure(text=str(error), text_color=COLORS["warning"])
+            for item in self.browser_file_tree.get_children():
+                self.browser_file_tree.delete(item)
+            self._browser_files.clear()
+            self._browser_listing_signature = None
+            self._browser_query_signature = None
+            self._browser_selected_path = None
+            self._browser_selected_signature = None
+            self._clear_browser_preview()
+            self.browser_summary.configure(text="Selecione um arquivo para ver o gráfico e a tabela.")
+            return
+        signature = tuple((item.path, item.modified_at, item.size_bytes) for item in files)
+        query_signature = (root.resolve(), selected_day, self.browser_kind_option.get())
+        if signature == self._browser_listing_signature and query_signature == self._browser_query_signature:
+            return
+        self._browser_listing_signature = signature
+        self._browser_query_signature = query_signature
+        previously_selected = self._browser_selected_path
+        for item in self.browser_file_tree.get_children():
+            self.browser_file_tree.delete(item)
+        self._browser_files.clear()
+        selected_iid: Optional[str] = None
+        for index, item in enumerate(files):
+            iid = "file_{0}".format(index)
+            self._browser_files[iid] = item
+            try:
+                folder = str(item.path.parent.relative_to(root.resolve())) or "."
+            except ValueError:
+                folder = str(item.path.parent)
+            self.browser_file_tree.insert(
+                "", "end", iid=iid,
+                values=(item.path.name, item.day.isoformat(), item.kind, folder),
+            )
+            if item.path == previously_selected:
+                selected_iid = iid
+        self.browser_status.configure(
+            text="{0} arquivo(s) encontrado(s) em {1}".format(len(files), root.resolve()),
+            text_color=COLORS["muted"],
+        )
+        if selected_iid is None:
+            self._browser_selected_path = None
+            self._browser_selected_signature = None
+            self._clear_browser_preview()
+            self.browser_summary.configure(text="Selecione um arquivo para ver o gráfico e a tabela.")
+        else:
+            self.browser_file_tree.selection_set(selected_iid)
+            self.browser_file_tree.see(selected_iid)
+            self._browser_file_selected()
+
+    def _browser_file_selected(self, _event: Any = None) -> None:
+        selection = self.browser_file_tree.selection()
+        if not selection:
+            return
+        item = self._browser_files.get(selection[0])
+        if item is None:
+            return
+        signature = (item.path, item.modified_at, item.size_bytes)
+        if signature == self._browser_selected_signature:
+            return
+        self._browser_selected_path = item.path
+        self._browser_selected_signature = signature
+        self._clear_browser_preview(item.path)
+        try:
+            points = read_acquisition_file(item.path)
+        except Exception as error:
+            self.browser_summary.configure(
+                text="Não foi possível abrir {0}: {1}".format(item.path.name, error),
+                text_color=COLORS["warning"],
+            )
+            return
+        self._browser_points = points
+        self._browser_unit = next((point.unit for point in points if point.unit), "")
+        self.browser_summary.configure(
+            text="{0} ponto(s) · {1} · {2}".format(len(points), item.kind, item.day.isoformat()),
+            text_color=COLORS["text"],
+        )
+        self._draw_chart(
+            self.current_state,
+            readings=points,
+            canvas=self.browser_chart,
+            unit=self._browser_unit,
+        )
+        self._render_browser_table_batch(0, self._browser_generation)
+
+    def _render_browser_table_batch(self, start: int, generation: int) -> None:
+        self._browser_table_after_id = None
+        if generation != self._browser_generation:
+            return
+        for point in self._browser_points[start : start + 500]:
+            value_text = "{0:.8E}".format(point.value) if math.isfinite(point.value) else point.raw_value
+            self.browser_point_tree.insert(
+                "", "end",
+                values=(point.index, "{0:.6g}".format(point.timestamp), value_text, point.unit),
+            )
+        if start + 500 < len(self._browser_points):
+            self._browser_table_after_id = self.after(
+                1, self._render_browser_table_batch, start + 500, generation
+            )
+
+    def _refresh_acquisition_filename(self) -> None:
+        """Generate a fresh automatic name and clear the previous display."""
+
+        if self.current_state.busy or self.current_state.acquisition_running:
+            return
+        self._acquisition_name_automatic = True
+        self._set_default_acquisition_filename(
+            self.acquisition_mode.get(), force=True
+        )
+        self._suppress_existing_readings = True
+        self._last_table_index = 0
+        self._chart_hover_index = None
+        for item in self.reading_tree.get_children():
+            self.reading_tree.delete(item)
+        self._draw_chart(self.current_state, readings=())
 
     def _start_acquisition(self) -> None:
         if self.current_state.instrument_snapshot.zero_check is True:
@@ -1533,11 +1889,12 @@ class Keithley6517UI(ctk.CTk):
             )
             return
         self._last_table_index = 0
+        self._suppress_existing_readings = True
         for item in self.reading_tree.get_children():
             self.reading_tree.delete(item)
         mode = self.acquisition_mode.get()
         if self._acquisition_name_automatic:
-            self._set_default_acquisition_filename(mode)
+            self._set_default_acquisition_filename(mode, force=True)
         self._emit(
             IntentKind.START_ACQUISITION,
             mode=mode,
@@ -1614,7 +1971,14 @@ class Keithley6517UI(ctk.CTk):
         self._emit(IntentKind.SHUTDOWN)
 
     def _cancel_own_timers(self) -> None:
-        for attribute in ("_preview_after_id", "_poll_after_id", "_monitor_after_id"):
+        for attribute in (
+            "_preview_after_id",
+            "_poll_after_id",
+            "_monitor_after_id",
+            "_file_browser_after_id",
+            "_browser_filter_after_id",
+            "_browser_table_after_id",
+        ):
             timer_id = getattr(self, attribute, None)
             if timer_id is not None:
                 try:
@@ -1652,10 +2016,6 @@ class Keithley6517UI(ctk.CTk):
     def _render(self, state: ViewState) -> None:
         previous = self.current_state
         self.current_state = state
-        if previous.acquisition_running and not state.acquisition_running and self._acquisition_name_automatic:
-            self._set_default_acquisition_filename(self.acquisition_mode.get(), force=True)
-        elif self._acquisition_name_automatic:
-            self._set_default_acquisition_filename(self.acquisition_mode.get())
         if state.active_page != self._visible_page:
             self._show_page(state.active_page, dispatch=False)
         if state.theme != previous.theme:
@@ -1811,9 +2171,17 @@ class Keithley6517UI(ctk.CTk):
 
         self._set_widget_state(self.start_acquisition_button, "normal" if state.connected and state.measurement_configured and not state.acquisition_running and not state.busy else "disabled")
         self._set_widget_state(self.stop_acquisition_button, "normal" if state.acquisition_running else "disabled")
-        target = max(1, state.acquisition_target)
-        self.acquisition_progress.set(min(1.0, state.acquisition_count / target))
-        self.acquisition_counter.configure(text="{0} / {1}".format(state.acquisition_count, state.acquisition_target))
+        self._set_widget_state(
+            self.refresh_filename_button,
+            "disabled" if state.busy or state.acquisition_running else "normal",
+        )
+        if self._suppress_existing_readings:
+            self.acquisition_progress.set(0)
+            self.acquisition_counter.configure(text="0 / 0")
+        else:
+            target = max(1, state.acquisition_target)
+            self.acquisition_progress.set(min(1.0, state.acquisition_count / target))
+            self.acquisition_counter.configure(text="{0} / {1}".format(state.acquisition_count, state.acquisition_target))
         self._render_readings(state)
 
         self.hv_status_labels["state"].configure(text=state.hv_state, text_color=COLORS["danger"] if state.hv_active else COLORS["success"])
@@ -1843,6 +2211,15 @@ class Keithley6517UI(ctk.CTk):
             messagebox.showerror("Keithley 6517", state.error_banner, parent=self)
 
     def _render_readings(self, state: ViewState) -> None:
+        if self._suppress_existing_readings:
+            for item in self.reading_tree.get_children():
+                self.reading_tree.delete(item)
+            self._chart_hover_index = None
+            if state.acquisition_running and state.acquisition_count == 0 and not state.readings:
+                self._suppress_existing_readings = False
+            else:
+                self._draw_chart(state, readings=())
+                return
         inserted_reading = False
         if state.acquisition_count < self._last_table_index:
             self._last_table_index = 0
@@ -1877,38 +2254,49 @@ class Keithley6517UI(ctk.CTk):
             self.reading_tree.see(children[-1])
         self._draw_chart(state)
 
-    def _draw_chart(self, state: ViewState) -> None:
-        self.chart.delete("all")
-        self._chart_points = []
-        width = max(200, self.chart.winfo_width())
-        height = max(160, self.chart.winfo_height())
+    def _draw_chart(
+        self,
+        state: ViewState,
+        readings: Optional[Tuple[Any, ...]] = None,
+        canvas: Optional[tk.Canvas] = None,
+        unit: Optional[str] = None,
+    ) -> None:
+        plot_canvas = canvas if canvas is not None else self.chart
+        is_live_chart = plot_canvas is self.chart
+        plot_canvas.delete("all")
+        if is_live_chart:
+            self._chart_points = []
+        width = max(200, plot_canvas.winfo_width())
+        height = max(160, plot_canvas.winfo_height())
         background = "#FFFFFF" if state.theme == "Light" else "#202020"
         grid = "#CED6DE" if state.theme == "Light" else "#3C3C3C"
         foreground = "#0067B8" if state.theme == "Light" else "#4EC9B0"
         axis = "#66717D" if state.theme == "Light" else "#A6A6A6"
-        self.chart.configure(bg=background)
+        plot_canvas.configure(bg=background)
         plot_left = 48
         plot_right = width - 12
         plot_top = 18
         plot_bottom = height - 38
-        readings = [
+        source_readings = state.readings if readings is None else readings
+        plottable_readings = [
             reading
-            for reading in state.readings
+            for reading in source_readings
             if (
                 _reading_is_plottable(reading.status)
                 and math.isfinite(reading.value)
                 and math.isfinite(reading.timestamp)
             )
         ]
-        values = [(reading.timestamp, reading.value) for reading in readings]
-        if len(values) < 2:
-            self._chart_hover_index = None
+        values = [(reading.timestamp, reading.value) for reading in plottable_readings]
+        if not values:
+            if is_live_chart:
+                self._chart_hover_index = None
             invalid_count = sum(
                 1
-                for reading in state.readings
+                for reading in source_readings
                 if not _reading_is_plottable(reading.status)
             )
-            if invalid_count and state.instrument_snapshot.zero_check is True:
+            if invalid_count and is_live_chart and state.instrument_snapshot.zero_check is True:
                 empty_text = (
                     "Sem dados válidos para o gráfico\n"
                     "Zero Check está ligado no instrumento"
@@ -1920,7 +2308,7 @@ class Keithley6517UI(ctk.CTk):
             else:
                 empty_text = "Aguardando dados válidos"
                 empty_color = "#808080"
-            self.chart.create_text(
+            plot_canvas.create_text(
                 width / 2,
                 height / 2,
                 text=empty_text,
@@ -1938,8 +2326,8 @@ class Keithley6517UI(ctk.CTk):
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
             y = plot_top + fraction * (plot_bottom - plot_top)
             axis_value = maximum - fraction * (maximum - minimum)
-            self.chart.create_line(plot_left, y, plot_right, y, fill=grid)
-            self.chart.create_text(
+            plot_canvas.create_line(plot_left, y, plot_right, y, fill=grid)
+            plot_canvas.create_text(
                 plot_left - 6,
                 y,
                 text="{0:.5g}".format(axis_value),
@@ -1947,13 +2335,13 @@ class Keithley6517UI(ctk.CTk):
                 anchor="e",
                 font=("Segoe UI", 8),
             )
-        self.chart.create_line(plot_left, plot_top, plot_left, plot_bottom, fill=axis)
-        self.chart.create_line(plot_left, plot_bottom, plot_right, plot_bottom, fill=axis)
+        plot_canvas.create_line(plot_left, plot_top, plot_left, plot_bottom, fill=axis)
+        plot_canvas.create_line(plot_left, plot_bottom, plot_right, plot_bottom, fill=axis)
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
             x = plot_left + fraction * (plot_right - plot_left)
             axis_time = first + fraction * (last - first)
-            self.chart.create_line(x, plot_bottom, x, plot_bottom + 4, fill=axis)
-            self.chart.create_text(
+            plot_canvas.create_line(x, plot_bottom, x, plot_bottom + 4, fill=axis)
+            plot_canvas.create_text(
                 x,
                 plot_bottom + 7,
                 text="{0:.5g}".format(axis_time),
@@ -1961,15 +2349,15 @@ class Keithley6517UI(ctk.CTk):
                 anchor="n",
                 font=("Segoe UI", 8),
             )
-        self.chart.create_text(
+        plot_canvas.create_text(
             plot_left,
             3,
-            text="Valor ({0})".format(state.reading_unit),
+            text="Valor ({0})".format(state.reading_unit if unit is None else unit),
             fill=axis,
             anchor="nw",
             font=("Segoe UI", 8, "bold"),
         )
-        self.chart.create_text(
+        plot_canvas.create_text(
             plot_right,
             height - 3,
             text="Tempo (s)",
@@ -1978,14 +2366,18 @@ class Keithley6517UI(ctk.CTk):
             font=("Segoe UI", 8, "bold"),
         )
         points: List[float] = []
-        for reading in readings:
+        for reading in plottable_readings:
             x = plot_left + (reading.timestamp - first) / span_x * (plot_right - plot_left)
             value = reading.value
             y = plot_top + (maximum - value) / (maximum - minimum) * (plot_bottom - plot_top)
             points.extend((x, y))
-            self._chart_points.append((x, y, reading.timestamp, value, reading.index))
-        self.chart.create_line(*points, fill=foreground, width=2, smooth=False)
-        if self._chart_hover_index is not None:
+            if is_live_chart:
+                self._chart_points.append((x, y, reading.timestamp, value, reading.index))
+        if len(points) == 2:
+            plot_canvas.create_oval(points[0] - 3, points[1] - 3, points[0] + 3, points[1] + 3, fill=foreground, outline=foreground)
+        else:
+            plot_canvas.create_line(*points, fill=foreground, width=2, smooth=False)
+        if is_live_chart and self._chart_hover_index is not None:
             hovered = next(
                 (point for point in self._chart_points if point[4] == self._chart_hover_index),
                 None,
@@ -2115,6 +2507,12 @@ class Keithley6517UI(ctk.CTk):
         )
         style.map("Treeview", background=[("selected", selection)], foreground=[("selected", "#FFFFFF")])
         self.chart.configure(bg="#202020" if dark else "#FFFFFF")
+        self._draw_chart(
+            self.current_state,
+            readings=self._browser_points,
+            canvas=self.browser_chart,
+            unit=self._browser_unit,
+        )
 
 
 __all__ = ["Keithley6517UI"]

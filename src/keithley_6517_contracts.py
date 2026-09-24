@@ -17,6 +17,7 @@ class PageId(Enum):
     CONNECTION = "connection"
     MEASUREMENT = "measurement"
     ACQUISITION = "acquisition"
+    FILES = "files"
     HIGH_VOLTAGE = "high_voltage"
     SCPI = "scpi"
     LOGS = "logs"

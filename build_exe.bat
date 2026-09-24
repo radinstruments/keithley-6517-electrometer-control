@@ -7,6 +7,7 @@ echo Construindo Keithley 6517 Control Studio...
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name "Keithley6517ControlStudio" ^
   --icon "assets\branding\keithley_6517_spectrum_icon.ico" ^
+  --version-file "packaging\version_info.txt" ^
   --paths "." ^
   --add-data "assets;assets" ^
   --collect-all customtkinter ^

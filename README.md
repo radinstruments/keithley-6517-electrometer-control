@@ -4,6 +4,8 @@
 
 <h1 align="center">Keithley 6517 Electrometer Control</h1>
 
+<p align="center">Versão 1.0.1 · <a href="https://github.com/radinstruments/keithley-6517-electrometer-control/releases">Downloads para Windows</a></p>
+
 <p align="center">
   Controle, configuração e aquisição de dados para eletrômetros Keithley 6517A e 6517B.
 </p>
@@ -104,6 +106,8 @@ O fluxo recomendado é:
 7. Desligar a HV pelo comando de standby antes de tocar no circuito ou desconectar o instrumento.
 
 As leituras são classificadas internamente para o gráfico e os logs. Ao final de cada aquisição, os arquivos CSV e XLSX com as quatro colunas exibidas na tabela são salvos automaticamente em `data/`; os logs ficam em `log/` e as preferências em `config/`. No executável, essas três pastas ficam em `Documentos\Keithley6517ControlStudio\`.
+
+Na página **Arquivos** (ícone de pasta), a lista percorre as subpastas da pasta escolhida e é atualizada automaticamente enquanto a página está aberta. É possível filtrar por data (`AAAA-MM-DD`) e por formato (`CSV` ou `XLSX`). Ao selecionar um arquivo no formato de aquisição do aplicativo, a página mostra o caminho completo, o gráfico e a tabela com os pontos salvos. A data vem das pastas `AAAA/MM/DD`, do horário no nome do arquivo ou da data de modificação, nessa ordem.
 
 ## Segurança
 

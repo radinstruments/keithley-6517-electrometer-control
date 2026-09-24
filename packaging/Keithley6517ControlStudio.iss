@@ -1,7 +1,7 @@
 ; Inno Setup installer for Keithley 6517 Control Studio
 
 #define AppName "Keithley 6517 Control Studio"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppExeName "Keithley6517ControlStudio.exe"
 
 [Setup]
